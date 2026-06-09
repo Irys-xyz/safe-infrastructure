@@ -2,3 +2,12 @@
 .DS_Store
 .idea/
 data/
+claude/
+.claude/
+
+# Ansible deploy config — host address + (vaulted) secrets, never commit
+ansible/inventory.ini
+ansible/vars.yml
+
+# Per-service secrets — hold real values; commit the *.env.example templates instead.
+container_env_files/*.env

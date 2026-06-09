@@ -2,6 +2,10 @@
 
 set -e
 
+# Run from the repository root so `docker compose` resolves docker-compose.yml and .env
+# regardless of the directory this script was invoked from.
+cd "$(dirname "$0")/.."
+
 echo "==> $(date +%H:%M:%S) ==> Starting up environment containers..."
 docker compose pull \
   && docker compose down -v \

@@ -27,8 +27,13 @@ services:
   # Common nginx and database
   nginx:
     image: nginx:alpine
+    restart: unless-stopped
     ports:
       - "${REVERSE_PROXY_PORT}:8000"
+      # Same-origin entry for the wallet UI on host port 8080. The UI's baked gateway path is
+      # relative (/cgw), so the page and its /cgw calls share an origin (no CORS) on whatever
+      # host:port the stack is reached on. Admin/APIs remain available on both ports.
+      - "8080:8000"
     volumes:
       - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - nginx-shared-txs:/nginx-txs
@@ -42,6 +47,7 @@ services:
 
   txs-db:
     image: postgres:14-alpine
+    restart: unless-stopped
     command: -c 'max_connections=250'
     environment:
       POSTGRES_PASSWORD: postgres
@@ -51,6 +57,7 @@ services:
 
   cfg-db:
     image: postgres:14-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_PASSWORD: postgres
     volumes:
@@ -59,6 +66,7 @@ services:
 
   events-db:
     image: postgres:14-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_PASSWORD: postgres
     volumes:
@@ -67,6 +75,7 @@ services:
 
   cgw-db:
     image: postgres:14-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_PASSWORD: postgres
     volumes:
@@ -76,13 +85,16 @@ services:
   # Safe Transaction Service
   txs-redis:
     image: redis:alpine
+    restart: unless-stopped
     <<: *redishealthcheck
 
   txs-rabbitmq:
-    image: rabbitmq:alpine
+    image: rabbitmq:3.13-alpine
+    restart: unless-stopped
 
   txs-worker-indexer: &txs-worker
     image: safeglobal/safe-transaction-service:${TXS_VERSION}
+    restart: unless-stopped
     env_file:
       - container_env_files/txs.env
     environment:
@@ -117,6 +129,7 @@ services:
 
   txs-web:
     image: safeglobal/safe-transaction-service:${TXS_VERSION}
+    restart: unless-stopped
     env_file:
       - container_env_files/txs.env
     environment:
@@ -132,15 +145,14 @@ services:
   txs-scheduler:
     <<: *txs-worker
     depends_on:
-      txs-db:
-        condition: service_healthy
-      txs-redis:
+      txs-worker-indexer:
         condition: service_healthy
     command: docker/web/celery/scheduler/run.sh
 
   # Safe Config Service
   cfg-web:
     image: safeglobal/safe-config-service:${CFG_VERSION}
+    restart: unless-stopped
     tty: true
     volumes:
       - nginx-shared-cfg:/nginx
@@ -155,10 +167,12 @@ services:
   # Safe Client Gateway
   cgw-redis:
     image: redis:alpine
+    restart: unless-stopped
     <<: *redishealthcheck
 
   cgw-web:
     image: safeglobal/safe-client-gateway-nest:${CGW_VERSION}
+    restart: unless-stopped
     env_file:
       - container_env_files/cgw.env
     depends_on:
@@ -166,14 +180,27 @@ services:
         condition: service_healthy
 
   ui:
-    image: safeglobal/safe-wallet-web:${UI_VERSION}
+    # Irys (chain 3282) is not yet in the upstream image's bundled @safe-global/safe-deployments
+    # (pending safe-deployments PR #1555), so the stock image cannot create Safes on Irys. This
+    # custom image patches 3282 into the deployment data. Build it before bringing the stack up:
+    #   podman build -t localhost/safe-wallet-web-irys:3282 -f docker/ui-irys.Dockerfile .
+    image: localhost/safe-wallet-web-irys:3282
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: docker/ui-irys.Dockerfile
+      args:
+        # Baked into the static export. Sourced from .env (UI_GATEWAY_URL). Only used when the
+        # image is built via `docker compose build`; run_locally_podman.sh passes it directly.
+        NEXT_PUBLIC_GATEWAY_URL_PRODUCTION: ${UI_GATEWAY_URL:-/cgw}
     env_file:
       - container_env_files/ui.env
     expose:
       - 8080
 
   general-rabbitmq:
-    image: rabbitmq:alpine
+    image: rabbitmq:3.13-alpine
+    restart: unless-stopped
     healthcheck:
       test: rabbitmq-diagnostics -q ping
       interval: 15s
@@ -183,6 +210,7 @@ services:
 
   events-web:
     image: safeglobal/safe-events-service:${EVENTS_VERSION}
+    restart: unless-stopped
     env_file:
       - container_env_files/events.env
     depends_on:

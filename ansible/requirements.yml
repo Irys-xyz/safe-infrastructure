@@ -1,0 +1,4 @@
+---
+# Install on the control node: ansible-galaxy collection install -r requirements.yml
+collections:
+  - name: ansible.posix   # provides the synchronize (rsync) module

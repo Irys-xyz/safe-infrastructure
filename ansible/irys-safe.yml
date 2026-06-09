@@ -1,0 +1,366 @@
+---
+# Install, start, stop, or restart the self-hosted Safe{Wallet} stack for Irys
+# Mainnet (chain 3282) on a Debian host. The stack runs as a rootless podman
+# systemd --user service (systemd/irys-safe.service), so this playbook drives
+# `systemctl --user` as the unprivileged stack user via lingering + XDG_RUNTIME_DIR.
+#
+#   Install:  ansible-playbook -i inventory.ini irys-safe.yml -e @vars.yml
+#   Start:    ansible-playbook -i inventory.ini irys-safe.yml -e @vars.yml -e irys_action=start
+#   Stop:     ansible-playbook -i inventory.ini irys-safe.yml -e @vars.yml -e irys_action=stop
+#   Restart:  ansible-playbook -i inventory.ini irys-safe.yml -e @vars.yml -e irys_action=restart
+#   Status:   ansible-playbook -i inventory.ini irys-safe.yml -e @vars.yml -e irys_action=status
+#
+# See ansible/README.md for setup and ansible/vars.example.yml for the variables.
+
+- name: Manage the Irys Safe{Wallet} stack
+  hosts: irys
+  become: true
+  gather_facts: true
+
+  vars:
+    irys_action: install
+
+    # Stack runtime config (defaults; override in vars.yml).
+    irys_project_name: irys-safe-infrastructure
+    irys_reverse_proxy_port: 8000
+    irys_rpc_node_url: https://mainnet-beta-rpc.irys.xyz/v1/execution-rpc
+    # Client Gateway path baked into the UI at build time. Default is the relative /cgw, so the UI
+    # calls the same origin the page was served from (same-origin on the host's IP, hostname, or a
+    # domain -- no CORS). Override in vars.yml with an absolute URL only for a Client Gateway on a
+    # different origin; changing it triggers a one-off UI image rebuild + ui recreate on next deploy.
+    irys_ui_gateway_url: /cgw
+    irys_txs_version: latest
+    irys_cfg_version: latest
+    irys_cgw_version: latest
+    irys_events_version: latest
+
+    # Rootless subordinate id range (only used if the user has none yet).
+    subid_start: 100000
+    subid_count: 65536
+
+    # Local working copy pushed to the host (repo root = the Ansible dir's parent).
+    irys_src_dir: "{{ playbook_dir | dirname }}"
+    # Derived from the resolved stack user (lazy-evaluated once stack_* are set).
+    irys_dir: "{{ stack_home }}/irys-safe-infrastructure"
+    xdg_env:
+      XDG_RUNTIME_DIR: "/run/user/{{ stack_uid }}"
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ stack_uid }}/bus"
+
+    apt_packages:
+      - podman
+      - podman-compose
+      - podman-docker
+      - uidmap
+      - dbus-user-session
+      - slirp4netns
+      - passt
+      # netavark is the network backend; aardvark-dns is its DNS server. Without aardvark-dns
+      # rootless containers get networking but no name resolution, so every service-to-service
+      # lookup (cgw->cgw-redis, nginx->upstreams, txs->txs-db) fails with EAI_AGAIN. Debian
+      # ships aardvark-dns only as a Recommends, so a minimal podman install omits it.
+      - netavark
+      - aardvark-dns
+      - fuse-overlayfs
+      - rsync
+      - curl
+      - acl
+      # pipx installs a modern podman-compose (1.5.0) into the stack user's ~/.local/bin.
+      # The apt podman-compose (1.3.0) recreates the whole project on `up --no-deps`, which
+      # breaks the tiered bring-up: starting nginx (last tier) tears the running stack down.
+      - pipx
+
+  pre_tasks:
+    - name: Validate inputs
+      ansible.builtin.assert:
+        that:
+          - irys_action in ['install', 'start', 'stop', 'restart', 'status']
+          - stack_user is defined and stack_user | length > 0
+        fail_msg: >-
+          Set stack_user. irys_action must be one of install, start, stop,
+          restart, status.
+
+  tasks:
+    # --- install: system preparation (root) -------------------------------
+    - name: System preparation
+      when: irys_action == 'install'
+      block:
+        - name: Install host packages
+          ansible.builtin.apt:
+            name: "{{ apt_packages }}"
+            state: present
+            update_cache: true
+            cache_valid_time: 3600
+
+        # Fresh Debian ships registries.conf with unqualified-search-registries
+        # commented out, so podman cannot resolve the short image names the compose
+        # file uses (postgres:14-alpine, redis:alpine, safeglobal/...). Point them at
+        # Docker Hub via a non-destructive drop-in.
+        - name: Resolve unqualified (short-name) images to Docker Hub
+          ansible.builtin.copy:
+            dest: /etc/containers/registries.conf.d/99-irys-unqualified-search.conf
+            content: |
+              # Managed by ansible (irys-safe.yml).
+              unqualified-search-registries = ["docker.io"]
+            owner: root
+            group: root
+            mode: "0644"
+
+        # The UI `next build` needs ~8 GiB heap; on a host with < ~16 GiB RAM it OOMs
+        # ("JavaScript heap out of memory"). Back it with swap so the build (heap raised via
+        # NODE_OPTIONS in docker/ui-irys.Dockerfile) is not cut short by a system OOM.
+        - name: Ensure 8 GiB swap on RAM-constrained hosts (UI build OOMs without it)
+          when: ansible_memtotal_mb | int < 15000
+          block:
+            - name: Create the swapfile
+              ansible.builtin.command: fallocate -l 8G /swapfile
+              args:
+                creates: /swapfile
+              register: swapfile
+
+            - name: Format, secure, and activate a freshly created swapfile
+              when: swapfile is changed
+              block:
+                - name: Secure the swapfile
+                  ansible.builtin.file:
+                    path: /swapfile
+                    mode: "0600"
+                - name: Make it a swap area
+                  ansible.builtin.command: mkswap /swapfile
+                - name: Activate the swap
+                  ansible.builtin.command: swapon /swapfile
+
+            - name: Persist the swapfile in fstab
+              ansible.builtin.lineinfile:
+                path: /etc/fstab
+                line: "/swapfile none swap sw 0 0"
+                regexp: '^/swapfile\s'
+                create: true
+
+        - name: Ensure the unprivileged stack user exists
+          ansible.builtin.user:
+            name: "{{ stack_user }}"
+            create_home: true
+            shell: /bin/bash
+
+        - name: Enable lingering so the user service starts at boot
+          ansible.builtin.command: "loginctl enable-linger {{ stack_user }}"
+          args:
+            creates: "/var/lib/systemd/linger/{{ stack_user }}"
+
+    # --- resolve the stack user (all actions) -----------------------------
+    - name: Read the stack user from passwd
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ stack_user }}"
+
+    - name: Set uid / home facts
+      ansible.builtin.set_fact:
+        stack_uid: "{{ getent_passwd[stack_user][1] }}"
+        stack_home: "{{ getent_passwd[stack_user][4] }}"
+
+    - name: Ensure the user systemd manager is running
+      ansible.builtin.systemd_service:
+        name: "user@{{ stack_uid }}.service"
+        state: started
+      # System scope (root): brings up /run/user/<uid> and its DBus socket.
+
+    # --- install: rootless prep, code, unit, first start ------------------
+    - name: Deploy and enable the stack
+      when: irys_action == 'install'
+      block:
+        - name: Ensure rootless subuid range
+          ansible.builtin.lineinfile:
+            path: /etc/subuid
+            regexp: "^{{ stack_user }}:"
+            line: "{{ stack_user }}:{{ subid_start }}:{{ subid_count }}"
+            create: true
+            owner: root
+            group: root
+            mode: "0644"
+          register: subuid
+
+        - name: Ensure rootless subgid range
+          ansible.builtin.lineinfile:
+            path: /etc/subgid
+            regexp: "^{{ stack_user }}:"
+            line: "{{ stack_user }}:{{ subid_start }}:{{ subid_count }}"
+            create: true
+            owner: root
+            group: root
+            mode: "0644"
+          register: subgid
+
+        - name: Migrate podman storage after an id-range change
+          ansible.builtin.command: podman system migrate
+          become: true
+          become_user: "{{ stack_user }}"
+          environment: "{{ xdg_env }}"
+          when: subuid is changed or subgid is changed
+          changed_when: true
+
+        # The unit's PATH prefers ~/.local/bin, so this 1.5.0 launcher shadows the apt 1.3.0
+        # (whose `up --no-deps` recreates the whole project and breaks the tiered bring-up).
+        - name: Install podman-compose 1.5.0 for the stack user (apt 1.3.0 breaks `up --no-deps`)
+          ansible.builtin.command: pipx install 'podman-compose==1.5.0'
+          args:
+            creates: "{{ stack_home }}/.local/bin/podman-compose"
+          become: true
+          become_user: "{{ stack_user }}"
+          environment:
+            HOME: "{{ stack_home }}"
+            PATH: "{{ stack_home }}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+        - name: Sync the working copy to the host (rsync)
+          ansible.posix.synchronize:
+            src: "{{ irys_src_dir }}/"
+            dest: "{{ irys_dir }}/"
+            archive: true
+            owner: false
+            group: false
+            delete: false
+            rsync_opts:
+              - "--exclude=.git"
+              - "--exclude=data"
+              - "--exclude=.env"
+              - "--exclude=claude"
+              - "--exclude=.idea"
+              - "--exclude=ansible/inventory.ini"
+              - "--exclude=ansible/vars.yml"
+              # Per-service secrets are gitignored and provisioned out-of-band; the *.env.example
+              # templates still sync. Place container_env_files/*.env on a fresh host before start.
+              - "--exclude=container_env_files/*.env"
+          become: false
+
+        # Re-own the rsynced code tree to the stack user, but never recurse into ./data.
+        # The postgres subdirs there are chowned to container uid 70 (mapped through the
+        # rootless userns); a blanket `chown -R {{ irys_dir }}` would re-map them to the stack
+        # user (= container root), postgres would lose access to its own files, and every *-db
+        # container would crash-loop on the next install. rsync already excludes ./data, so
+        # podman alone owns what lives under it -- prune it from the chown.
+        - name: Ensure the deployed tree (excluding ./data) is owned by the stack user
+          ansible.builtin.command:
+            argv:
+              - find
+              - "{{ irys_dir }}"
+              - -path
+              - "{{ irys_dir }}/data"
+              - -prune
+              - -o
+              - -exec
+              - chown
+              - "{{ stack_user }}:{{ stack_user }}"
+              - "{}"
+              - +
+          become: true
+          changed_when: true
+
+        - name: Render the repo-root .env
+          ansible.builtin.template:
+            src: env.j2
+            dest: "{{ irys_dir }}/.env"
+            owner: "{{ stack_user }}"
+            group: "{{ stack_user }}"
+            mode: "0600"
+
+        - name: Ensure the user unit directory exists
+          ansible.builtin.file:
+            path: "{{ stack_home }}/.config/systemd/user"
+            state: directory
+            owner: "{{ stack_user }}"
+            group: "{{ stack_user }}"
+            mode: "0755"
+
+        - name: Install the systemd user unit
+          ansible.builtin.template:
+            src: irys-safe.service.j2
+            dest: "{{ stack_home }}/.config/systemd/user/irys-safe.service"
+            owner: "{{ stack_user }}"
+            group: "{{ stack_user }}"
+            mode: "0644"
+
+        - name: Stat the per-service secret files (not synced — must exist on the host)
+          ansible.builtin.stat:
+            path: "{{ irys_dir }}/container_env_files/{{ item }}"
+          loop:
+            - cfg.env
+            - cgw.env
+            - txs.env
+            - events.env
+            - ui.env
+          register: irys_env_files
+
+        - name: Fail clearly if any per-service secret file is missing
+          ansible.builtin.assert:
+            that: >-
+              (irys_env_files.results | selectattr('stat.exists') | list | length)
+              == (irys_env_files.results | length)
+            fail_msg: >-
+              container_env_files/*.env are gitignored and no longer synced by this playbook.
+              Provision them on the host first — copy each container_env_files/*.env.example to
+              *.env and fill the __CHANGE_ME__ / __PASSWORD__ placeholders — then re-run.
+
+        - name: Enable and start the stack (first run pulls images + builds the UI)
+          ansible.builtin.systemd_service:
+            name: irys-safe.service
+            scope: user
+            enabled: true
+            state: started
+            daemon_reload: true
+          become: true
+          become_user: "{{ stack_user }}"
+          environment: "{{ xdg_env }}"
+
+    # --- start / stop / restart -------------------------------------------
+    - name: "Run lifecycle action {{ irys_action }}"
+      when: irys_action in ['start', 'stop', 'restart']
+      ansible.builtin.systemd_service:
+        name: irys-safe.service
+        scope: user
+        state: "{{ {'start': 'started', 'stop': 'stopped', 'restart': 'restarted'}[irys_action] }}"
+      become: true
+      become_user: "{{ stack_user }}"
+      environment: "{{ xdg_env }}"
+
+    # --- status (read-only) -----------------------------------------------
+    - name: Report stack status
+      when: irys_action == 'status'
+      block:
+        - name: Query the service unit state
+          ansible.builtin.systemd_service:
+            name: irys-safe.service
+            scope: user
+          become: true
+          become_user: "{{ stack_user }}"
+          environment: "{{ xdg_env }}"
+          register: irys_unit
+          changed_when: false
+          failed_when: false
+
+        - name: Show service state
+          ansible.builtin.debug:
+            msg: >-
+              irys-safe.service —
+              active: {{ (irys_unit.status | default({})).get('ActiveState', 'unknown') }}
+              / sub: {{ (irys_unit.status | default({})).get('SubState', 'unknown') }}
+              / enabled: {{ (irys_unit.status | default({})).get('UnitFileState', 'unknown') }}
+
+        - name: Check the reverse-proxy endpoints (RUNBOOK section 9)
+          ansible.builtin.uri:
+            url: "http://localhost:{{ irys_reverse_proxy_port }}{{ item }}"
+            method: GET
+            timeout: 10
+          loop:
+            - /cfg/api/v1/about/
+            - /txs/api/v1/about/
+            - /cgw/about
+            - /
+          register: irys_endpoints
+          changed_when: false
+          failed_when: false
+
+        - name: Show reverse-proxy endpoint status
+          ansible.builtin.debug:
+            msg: "{{ item.status | default('ERR') }}  {{ item.item }}"
+          loop: "{{ irys_endpoints.results }}"
+          loop_control:
+            label: "{{ item.item }}"

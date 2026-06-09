@@ -1,0 +1,42 @@
+# irys-safe.service -- self-hosted Safe{Wallet} stack for Irys Mainnet (chain 3282).
+#
+# Runs the full stack (Config, Transaction, Client Gateway and Events services, plus
+# the Safe{Wallet} web UI behind nginx) as a rootless podman service. Start brings the
+# stack up through scripts/run_locally_podman.sh, which is idempotent: it builds the
+# custom Irys UI image if absent, starts each tier in dependency order, applies the
+# chain-3282 configuration, and verifies the endpoints. Stop runs `docker compose
+# down`, which removes the containers while leaving the ./data Postgres volumes intact.
+#
+# This is a rootless (per-user) service, matching the context the stack is built and
+# tested in. Install it as the unprivileged user that owns the clone -- not root:
+#
+#   loginctl enable-linger "$USER"            # let the service start at boot with no login
+#   install -Dm644 systemd/irys-safe.service ~/.config/systemd/user/irys-safe.service
+#   # If the clone is not at ~/irys-safe-infrastructure, edit WorkingDirectory below.
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now irys-safe.service
+#
+# Inspect:  systemctl --user status irys-safe
+# Follow:   journalctl --user -u irys-safe -f
+# Restart:  systemctl --user restart irys-safe
+# Stop:     systemctl --user stop irys-safe         # databases are preserved
+
+[Unit]
+Description=Self-hosted Safe{Wallet} stack for Irys Mainnet (chain 3282)
+Documentation=file:%h/irys-safe-infrastructure/RUNBOOK.md
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=%h/irys-safe-infrastructure
+# podman-compose installed via pip lands in ~/.local/bin; keep it on PATH.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# First start pulls several GB of images and builds the custom UI image (next build,
+# which needs 4-8 GiB RAM and runs for several minutes); raise this if it is killed.
+TimeoutStartSec=1800
+TimeoutStopSec=120
+ExecStart=/bin/bash scripts/run_locally_podman.sh
+ExecStop=/usr/bin/docker compose down
+
+[Install]
+WantedBy=default.target

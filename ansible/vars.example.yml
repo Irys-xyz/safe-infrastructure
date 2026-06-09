@@ -1,0 +1,36 @@
+# Copy to vars.yml and pass with -e @vars.yml. Encrypt secret values with
+# `ansible-vault encrypt_string`, or keep the whole file as an encrypted vault.
+
+# --- required ---
+stack_user: irys                 # unprivileged user that owns + runs the stack (rootless).
+                                 # Recommended: also your ansible_user, so the rsync deploy
+                                 # lands writable by the stack.
+
+# --- stack config ---
+irys_rpc_node_url: https://mainnet-beta-rpc.irys.xyz/v1/execution-rpc
+irys_reverse_proxy_port: 8000
+irys_project_name: irys-safe-infrastructure
+
+# Client Gateway path baked into the UI (default: relative /cgw = same-origin on any host, no CORS).
+# Override with an absolute URL only for a Client Gateway served from a different origin than the UI:
+#   irys_ui_gateway_url: https://safe.irys.xyz/cgw
+
+# Pin to exact tags for reproducibility (RUNBOOK section 10).
+irys_txs_version: latest
+irys_cfg_version: latest
+irys_cgw_version: latest
+irys_events_version: latest
+
+# --- optional: auto-create admin users on first start (vault the passwords) ---
+# irys_cfg_superuser_username: root
+# irys_cfg_superuser_email: admin@irys.xyz
+# irys_cfg_superuser_password: CHANGE_ME
+# irys_txs_superuser_username: root
+# irys_txs_superuser_email: admin@irys.xyz
+# irys_txs_superuser_password: CHANGE_ME
+
+# --- override only if not deploying into the stack user's home ---
+# irys_dir: /opt/irys-safe-infrastructure
+
+# --- deploy source (override only to push a different checkout) ---
+# irys_src_dir: "{{ playbook_dir | dirname }}"   # default: this repo (the Ansible dir's parent)

@@ -1,0 +1,24 @@
+# {{ ansible_managed }}
+# Self-hosted Safe{Wallet} stack for Irys Mainnet (chain 3282), rootless podman.
+# Mirrors systemd/irys-safe.service in the repo, with paths set by Ansible so the
+# unit honours irys_dir. Manage with: systemctl --user {start,stop,restart} irys-safe
+
+[Unit]
+Description=Self-hosted Safe{Wallet} stack for Irys Mainnet (chain 3282)
+Documentation=file:{{ irys_dir }}/RUNBOOK.md
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory={{ irys_dir }}
+# podman-compose from pip lands in ~/.local/bin; keep it on PATH.
+Environment=PATH={{ stack_home }}/.local/bin:/usr/local/bin:/usr/bin:/bin
+# First start pulls several GB and builds the custom UI image (next build,
+# 4-8 GiB RAM, several minutes); raise this if it is killed.
+TimeoutStartSec=1800
+TimeoutStopSec=120
+ExecStart=/bin/bash {{ irys_dir }}/scripts/run_locally_podman.sh
+ExecStop=/usr/bin/docker compose down
+
+[Install]
+WantedBy=default.target
