@@ -34,6 +34,45 @@
     irys_cgw_version: latest
     irys_events_version: latest
 
+    # Edge hardening toggles (see ansible/vars.example.yml). irys_safe_domain has no default
+    # and is asserted at deploy time.
+    irys_ssh_disable_passwords: true
+    irys_install_fail2ban: true
+
+    # Cloudflare Origin certificate paths on the host, and the IP allowlist for the web ports.
+    irys_origin_cert_path: /etc/caddy/origin.crt
+    irys_origin_key_path: /etc/caddy/origin.key
+    irys_cloudflare_fetch_ips: true
+    # Authenticated Origin Pulls (zone-level mTLS): Caddy requires Cloudflare's client cert.
+    # Enable it in the Cloudflare dashboard BEFORE deploying, or the origin rejects everything.
+    irys_cf_authenticated_origin_pull: true
+    irys_cf_aop_ca_path: /etc/caddy/cloudflare-aop-ca.pem
+    # Bundled Cloudflare ranges; refreshed from cloudflare.com at deploy when the toggle is on.
+    cloudflare_ipv4:
+      - 173.245.48.0/20
+      - 103.21.244.0/22
+      - 103.22.200.0/22
+      - 103.31.4.0/22
+      - 141.101.64.0/18
+      - 108.162.192.0/18
+      - 190.93.240.0/20
+      - 188.114.96.0/20
+      - 197.234.240.0/22
+      - 198.41.128.0/17
+      - 162.158.0.0/15
+      - 104.16.0.0/13
+      - 104.24.0.0/14
+      - 172.64.0.0/13
+      - 131.0.72.0/22
+    cloudflare_ipv6:
+      - 2400:cb00::/32
+      - 2606:4700::/32
+      - 2803:f800::/32
+      - 2405:b500::/32
+      - 2405:8100::/32
+      - 2a06:98c0::/29
+      - 2c0f:f248::/32
+
     # Rootless subordinate id range (only used if the user has none yet).
     subid_start: 100000
     subid_count: 65536
@@ -64,6 +103,11 @@
       - rsync
       - curl
       - acl
+      # Edge hardening: TLS reverse proxy (Caddy), host firewall (nftables), and an SSH
+      # brute-force backstop (fail2ban). nftables ships on Debian but is listed for clarity.
+      - caddy
+      - nftables
+      - fail2ban
       # pipx installs a modern podman-compose (1.5.0) into the stack user's ~/.local/bin.
       # The apt podman-compose (1.3.0) recreates the whole project on `up --no-deps`, which
       # breaks the tiered bring-up: starting nginx (last tier) tears the running stack down.
@@ -84,6 +128,21 @@
     - name: System preparation
       when: irys_action == 'install'
       block:
+        - name: Install the official Caddy apt signing key
+          ansible.builtin.get_url:
+            url: https://dl.cloudsmith.io/public/caddy/stable/gpg.key
+            dest: /usr/share/keyrings/caddy-stable-archive-keyring.asc
+            mode: "0644"
+
+        # Debian ships Caddy 2.6.2, which predates the trusted_proxies/client_ip_headers and
+        # trust_pool (mTLS) Caddyfile syntax used below. The official repo provides a current,
+        # maintained Caddy.
+        - name: Add the official Caddy apt repository
+          ansible.builtin.apt_repository:
+            repo: "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.asc] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main"
+            filename: caddy-stable
+            state: present
+
         - name: Install host packages
           ansible.builtin.apt:
             name: "{{ apt_packages }}"
@@ -230,6 +289,7 @@
               # templates still sync. Place container_env_files/*.env on a fresh host before start.
               - "--exclude=container_env_files/*.env"
           become: false
+          notify: Restart irys-safe stack
 
         # Re-own the rsynced code tree to the stack user, but never recurse into ./data.
         # The postgres subdirs there are chowned to container uid 70 (mapped through the
@@ -310,6 +370,186 @@
           become_user: "{{ stack_user }}"
           environment: "{{ xdg_env }}"
 
+    # --- install: edge hardening (TLS proxy, firewall, SSH) ---------------
+    - name: Edge hardening (Caddy TLS, nftables firewall, SSH)
+      when: irys_action == 'install'
+      block:
+        - name: Require a domain and a Cloudflare Origin certificate
+          ansible.builtin.assert:
+            that:
+              - irys_safe_domain is defined and irys_safe_domain | length > 0
+              - irys_origin_cert is defined and irys_origin_cert | length > 0
+              - irys_origin_key is defined and irys_origin_key | length > 0
+            fail_msg: >-
+              Set irys_safe_domain and provide irys_origin_cert / irys_origin_key (the Cloudflare
+              Origin Certificate PEM and key, vaulted). Generate them in Cloudflare: SSL/TLS ->
+              Origin Server -> Create Certificate. See ansible/vars.example.yml.
+
+        - name: Install the Cloudflare Origin certificate
+          ansible.builtin.copy:
+            content: "{{ irys_origin_cert }}"
+            dest: "{{ irys_origin_cert_path }}"
+            owner: root
+            group: caddy
+            mode: "0644"
+          notify: Reload caddy
+
+        - name: Install the Cloudflare Origin private key
+          ansible.builtin.copy:
+            content: "{{ irys_origin_key }}"
+            dest: "{{ irys_origin_key_path }}"
+            owner: root
+            group: caddy
+            mode: "0640"
+          no_log: true
+          notify: Reload caddy
+
+        - name: Install the Cloudflare Authenticated-Origin-Pull CA certificate
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/files/cloudflare-aop-ca.pem"
+            dest: "{{ irys_cf_aop_ca_path }}"
+            owner: root
+            group: caddy
+            mode: "0644"
+          when: irys_cf_authenticated_origin_pull | default(true)
+          notify: Reload caddy
+
+        - name: Install the Caddy reverse-proxy config
+          ansible.builtin.template:
+            src: Caddyfile.j2
+            dest: /etc/caddy/Caddyfile
+            owner: root
+            group: root
+            mode: "0644"
+            validate: caddy validate --adapter caddyfile --config %s
+          notify: Reload caddy
+
+        - name: Enable and start Caddy
+          ansible.builtin.systemd_service:
+            name: caddy
+            enabled: true
+            state: started
+
+        - name: Refresh Cloudflare IP ranges (best-effort; falls back to the bundled defaults)
+          when: irys_cloudflare_fetch_ips | default(true)
+          block:
+            - name: Fetch Cloudflare IPv4 ranges
+              ansible.builtin.uri:
+                url: https://www.cloudflare.com/ips-v4
+                return_content: true
+              register: cf_v4
+              failed_when: false
+              changed_when: false
+
+            - name: Fetch Cloudflare IPv6 ranges
+              ansible.builtin.uri:
+                url: https://www.cloudflare.com/ips-v6
+                return_content: true
+              register: cf_v6
+              failed_when: false
+              changed_when: false
+
+            - name: Use the fetched ranges when both fetches succeed
+              ansible.builtin.set_fact:
+                cloudflare_ipv4: "{{ cf_v4.content.split() }}"
+                cloudflare_ipv6: "{{ cf_v6.content.split() }}"
+              when:
+                - cf_v4.status | default(0) == 200
+                - cf_v6.status | default(0) == 200
+                - cf_v4.content | default('') | length > 0
+                - cf_v6.content | default('') | length > 0
+
+        - name: Install the nftables host firewall (web ports limited to Cloudflare)
+          ansible.builtin.template:
+            src: nftables.conf.j2
+            dest: /etc/nftables.conf
+            owner: root
+            group: root
+            mode: "0755"
+            validate: nft -c -f %s
+          notify: Reload nftables
+
+        - name: Enable and start nftables
+          ansible.builtin.systemd_service:
+            name: nftables
+            enabled: true
+            state: started
+
+        - name: Harden sshd (key-only authentication)
+          ansible.builtin.template:
+            src: sshd-hardening.conf.j2
+            dest: /etc/ssh/sshd_config.d/10-irys-hardening.conf
+            owner: root
+            group: root
+            mode: "0644"
+          when: irys_ssh_disable_passwords | default(true)
+          notify: Reload sshd
+
+        - name: Validate the merged sshd config (the play aborts before reload if it is broken)
+          ansible.builtin.command: sshd -t
+          changed_when: false
+          when: irys_ssh_disable_passwords | default(true)
+
+        - name: Configure the fail2ban sshd jail
+          ansible.builtin.template:
+            src: jail.local.j2
+            dest: /etc/fail2ban/jail.local
+            owner: root
+            group: root
+            mode: "0644"
+          when: irys_install_fail2ban | default(true)
+          notify: Restart fail2ban
+
+        - name: Enable and start fail2ban
+          ansible.builtin.systemd_service:
+            name: fail2ban
+            enabled: true
+            state: started
+          when: irys_install_fail2ban | default(true)
+
+    # --- install: enforce Config/Gateway security settings on the host env -
+    # The per-service *.env are provisioned out-of-band (gitignored), so these tasks converge
+    # the security-critical keys on top of whatever was provisioned -- a deploy fixes the
+    # running host without hand edits. Secrets (SECRET_KEY, AUTH_TOKEN, passwords) are left to
+    # the operator / vault; only non-secret hardening settings are enforced here.
+    - name: Harden the Config and Client-Gateway service env
+      when: irys_action == 'install'
+      vars:
+        cfg_env: "{{ irys_dir }}/container_env_files/cfg.env"
+        cgw_env: "{{ irys_dir }}/container_env_files/cgw.env"
+      block:
+        - name: Config Service — disable DEBUG, scope ALLOWED_HOSTS and origins
+          ansible.builtin.lineinfile:
+            path: "{{ cfg_env }}"
+            regexp: "{{ item.regexp }}"
+            line: "{{ item.line }}"
+          loop:
+            - { regexp: '^DEBUG=', line: 'DEBUG=false' }
+            - { regexp: '^ROOT_LOG_LEVEL=', line: 'ROOT_LOG_LEVEL=INFO' }
+            - { regexp: '^DJANGO_ALLOWED_HOSTS=', line: 'DJANGO_ALLOWED_HOSTS="{{ irys_safe_domain }},nginx,localhost,127.0.0.1"' }
+            # http://localhost:8000 keeps the SSH-tunnel admin (Caddy 403s it publicly) usable.
+            - { regexp: '^CSRF_TRUSTED_ORIGINS=', line: 'CSRF_TRUSTED_ORIGINS="https://{{ irys_safe_domain }},http://localhost:8000"' }
+            - { regexp: '^MEDIA_URL', line: 'MEDIA_URL = "https://{{ irys_safe_domain }}/cfg/media/"' }
+          loop_control:
+            label: "{{ item.line }}"
+          notify: Restart irys-safe stack
+
+        - name: Client Gateway — point the post-login redirect at the real origin
+          ansible.builtin.lineinfile:
+            path: "{{ cgw_env }}"
+            regexp: '^AUTH_POST_LOGIN_REDIRECT_URI='
+            line: 'AUTH_POST_LOGIN_REDIRECT_URI=https://{{ irys_safe_domain }}'
+          notify: Restart irys-safe stack
+
+        - name: Client Gateway — set a strong JWT secret when one is provided
+          ansible.builtin.lineinfile:
+            path: "{{ cgw_env }}"
+            regexp: '^JWT_SECRET='
+            line: "JWT_SECRET={{ irys_cgw_jwt_secret }}"
+          when: irys_cgw_jwt_secret is defined and irys_cgw_jwt_secret | length > 0
+          no_log: true
+          notify: Restart irys-safe stack
+
     # --- start / stop / restart -------------------------------------------
     - name: "Run lifecycle action {{ irys_action }}"
       when: irys_action in ['start', 'stop', 'restart']
@@ -364,3 +604,35 @@
           loop: "{{ irys_endpoints.results }}"
           loop_control:
             label: "{{ item.item }}"
+
+  handlers:
+    - name: Reload caddy
+      ansible.builtin.systemd_service:
+        name: caddy
+        state: reloaded
+
+    - name: Reload nftables
+      ansible.builtin.systemd_service:
+        name: nftables
+        state: reloaded
+
+    - name: Reload sshd
+      ansible.builtin.systemd_service:
+        name: ssh
+        state: reloaded
+
+    - name: Restart fail2ban
+      ansible.builtin.systemd_service:
+        name: fail2ban
+        state: restarted
+
+    # The stack reads its env at container start, so config changes (hardened env, new
+    # compose port bindings) only take effect on a restart. Runs as the rootless stack user.
+    - name: Restart irys-safe stack
+      ansible.builtin.systemd_service:
+        name: irys-safe.service
+        scope: user
+        state: restarted
+      become: true
+      become_user: "{{ stack_user }}"
+      environment: "{{ xdg_env }}"

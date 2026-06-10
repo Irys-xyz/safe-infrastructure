@@ -1,0 +1,73 @@
+# {{ ansible_managed }}
+# Origin TLS for the Irys Safe{Wallet} stack ({{ inventory_hostname }}), behind Cloudflare.
+# Cloudflare terminates TLS for browsers at its edge; this serves the Cloudflare->origin leg
+# (dashboard SSL/TLS mode "Full (strict)") with a Cloudflare Origin Certificate and reverse-
+# proxies to the stack's nginx on 127.0.0.1:{{ irys_reverse_proxy_port }}. No ACME -- the origin
+# cert is static (15-year, Cloudflare-issued). The host firewall admits 80/443 only from
+# Cloudflare's IP ranges, so the origin cannot be reached directly, bypassing the edge.
+{
+    # Static origin cert: no automatic HTTPS / ACME / managed redirects.
+    auto_https off
+
+    # Trust Cloudflare as the only upstream proxy, and read the real visitor IP from the header
+    # Cloudflare sets (CF-Connecting-IP). Without this the stack attributes every request to a
+    # Cloudflare address. Safe because the firewall only admits Cloudflare to the web ports.
+    servers {
+        trusted_proxies static {{ ((cloudflare_ipv4 | default([])) + (cloudflare_ipv6 | default([]))) | join(' ') }}
+        client_ip_headers Cf-Connecting-Ip
+    }
+}
+
+# Redirect plain-HTTP origin pulls to HTTPS (belt-and-suspenders; Cloudflare's
+# "Always Use HTTPS" should already do this at the edge).
+http://{{ irys_safe_domain }} {
+    redir https://{{ irys_safe_domain }}{uri} permanent
+}
+
+https://{{ irys_safe_domain }} {
+{% if irys_cf_authenticated_origin_pull | default(true) %}
+    # Authenticated Origin Pulls (zone-level mTLS): only accept a connection presenting a client
+    # certificate signed by Cloudflare's origin-pull CA, so even a host inside Cloudflare's IP
+    # ranges cannot reach the origin without Cloudflare's own client cert. ENABLE it in the
+    # Cloudflare dashboard (SSL/TLS -> Origin Server -> Authenticated Origin Pulls) BEFORE
+    # deploying this, or Caddy rejects every connection and the site goes dark.
+    tls {{ irys_origin_cert_path }} {{ irys_origin_key_path }} {
+        client_auth {
+            mode require_and_verify
+            trust_pool file {
+                pem_file {{ irys_cf_aop_ca_path }}
+            }
+        }
+    }
+{% else %}
+    tls {{ irys_origin_cert_path }} {{ irys_origin_key_path }}
+{% endif %}
+
+    # The stack's nginx sets no security headers; add them here.
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Frame-Options "DENY"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        # Drop the upstream's misleading "Front-End-Https: on" header and the Server banner.
+        -Front-End-Https
+        -Server
+    }
+
+    # Django admin panels are NOT exposed. Reach them through an SSH local-forward:
+    #   ssh -L 8000:127.0.0.1:{{ irys_reverse_proxy_port }} {{ inventory_hostname }}
+    #   then browse http://localhost:8000/cfg/admin/
+    handle /cfg/admin* {
+        respond 403
+    }
+    handle /txs/admin* {
+        respond 403
+    }
+    handle /events/admin* {
+        respond 403
+    }
+
+    handle {
+        reverse_proxy 127.0.0.1:{{ irys_reverse_proxy_port }}
+    }
+}

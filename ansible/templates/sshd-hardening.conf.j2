@@ -1,0 +1,7 @@
+# {{ ansible_managed }}
+# SSH hardening for {{ inventory_hostname }} (drop-in; merged via Include sshd_config.d/*.conf).
+# Key-only authentication. root keeps key-based access (prohibit-password); the irys stack
+# user has no SSH key and is administered via root, so disabling passwords locks no one out.
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin prohibit-password

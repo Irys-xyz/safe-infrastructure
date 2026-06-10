@@ -1,0 +1,61 @@
+#!/usr/sbin/nft -f
+# {{ ansible_managed }}
+# Host firewall for {{ inventory_hostname }}, behind Cloudflare. Default-deny inbound. SSH (22)
+# is open; the web ports (80/443) are admitted ONLY from Cloudflare's published IP ranges, so
+# the origin cannot be reached directly (bypassing the edge cert + WAF). The Safe stack's nginx
+# is on 127.0.0.1 and reached through Caddy over the loopback. One inet table covers v4 + v6.
+#
+# Rootless podman networks inside the stack user's namespace and does not touch this (host init)
+# ruleset, so flushing here is safe.
+
+flush ruleset
+
+table inet filter {
+    set cloudflare_v4 {
+        type ipv4_addr
+        flags interval
+{% if cloudflare_ipv4 | default([]) | length > 0 %}
+        elements = { {{ cloudflare_ipv4 | join(', ') }} }
+{% endif %}
+    }
+
+    set cloudflare_v6 {
+        type ipv6_addr
+        flags interval
+{% if cloudflare_ipv6 | default([]) | length > 0 %}
+        elements = { {{ cloudflare_ipv6 | join(', ') }} }
+{% endif %}
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        iif "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+
+        # ICMP (v4) and ICMPv6 (echo + v6 neighbour discovery / path-MTU — do not block).
+        ip protocol icmp icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded } accept
+        ip6 nexthdr icmpv6 accept
+
+        # SSH (open to all; fail2ban + key-only auth guard it).
+        tcp dport 22 accept
+
+        # Web ports: only from Cloudflare. Direct-to-origin hits are dropped.
+        tcp dport { 80, 443 } ip  saddr @cloudflare_v4 accept
+        tcp dport { 80, 443 } ip6 saddr @cloudflare_v6 accept
+{% if irys_extra_open_tcp_ports | default([]) | length > 0 %}
+
+        # Extra ports opened via irys_extra_open_tcp_ports (from any source).
+        tcp dport { {{ irys_extra_open_tcp_ports | join(', ') }} } accept
+{% endif %}
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}

@@ -29,6 +29,53 @@ irys_events_version: latest
 # irys_txs_superuser_email: admin@irys.xyz
 # irys_txs_superuser_password: CHANGE_ME
 
+# --- edge hardening: TLS proxy (Caddy), host firewall (nftables), SSH ---
+# Public DNS name for the wallet. Create its A/AAAA records in Cloudflare pointing at this
+# host and set them to Proxied (orange cloud) BEFORE deploying — there is no ACME at the
+# origin (Caddy serves the static Cloudflare Origin Certificate below), and the firewall
+# admits the web ports only from Cloudflare, so grey-cloud (direct) DNS would be unreachable.
+# Also used to scope the Config Service ALLOWED_HOSTS / CSRF origins and the CGW redirect.
+irys_safe_domain: safe.irys.xyz
+
+# Cloudflare "Full (strict)" origin certificate for the Cloudflare->origin leg. Generate it in
+# Cloudflare (SSL/TLS -> Origin Server -> Create Certificate) for safe.irys.xyz / *.irys.xyz,
+# then paste the PEM cert and key here, VAULTED. Caddy serves them on :443; the host firewall
+# admits 80/443 only from Cloudflare's ranges. Set the dashboard SSL mode to Full(strict) and
+# turn on "Always Use HTTPS".
+#   ansible-vault encrypt_string "$(cat origin.pem)" --name irys_origin_cert
+#   ansible-vault encrypt_string "$(cat origin.key)" --name irys_origin_key
+irys_origin_cert: |
+  -----BEGIN CERTIFICATE-----
+  CHANGE_ME
+  -----END CERTIFICATE-----
+irys_origin_key: |
+  -----BEGIN PRIVATE KEY-----
+  CHANGE_ME
+  -----END PRIVATE KEY-----
+# Refresh the Cloudflare IP allowlist from cloudflare.com at deploy (default true; the bundled
+# list in irys-safe.yml is the fallback).
+# irys_cloudflare_fetch_ips: true
+
+# Authenticated Origin Pulls (zone-level mTLS): Caddy requires Cloudflare's client certificate,
+# so the origin rejects anything that is not Cloudflare — even from within CF's IP ranges. ENABLE
+# it in the Cloudflare dashboard (SSL/TLS -> Origin Server -> Authenticated Origin Pulls, zone-
+# level) BEFORE deploying, or the site goes dark. Set false to skip the mTLS requirement.
+# irys_cf_authenticated_origin_pull: true
+
+# Disable SSH password authentication (key-only). root already has a key; the irys stack user
+# has none and is managed via root, so this locks no one out. Set false to leave sshd untouched.
+irys_ssh_disable_passwords: true
+# Install fail2ban with an sshd jail as a brute-force backstop (port 22 is not rate-limited).
+irys_install_fail2ban: true
+
+# Extra inbound TCP ports to open in the host firewall. Default opens only 22, 80, 443.
+# irys_extra_open_tcp_ports: [5555]
+
+# Optional strong secret for the Client Gateway SIWE JWTs. Vault it; if unset, the gateway
+# keeps whatever cgw.env already has (leave the example's __CHANGE_ME__ unfilled at your peril).
+#   ansible-vault encrypt_string "$(openssl rand -hex 32)" --name irys_cgw_jwt_secret
+# irys_cgw_jwt_secret: CHANGE_ME
+
 # --- override only if not deploying into the stack user's home ---
 # irys_dir: /opt/irys-safe-infrastructure
 

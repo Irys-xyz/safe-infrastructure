@@ -1,0 +1,11 @@
+# {{ ansible_managed }}
+# fail2ban: backstop SSH brute force (the host firewall does not rate-limit port 22).
+# Reads sshd auth failures from journald (Debian's fail2ban systemd backend).
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+backend  = systemd
+
+[sshd]
+enabled = true

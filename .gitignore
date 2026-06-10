@@ -11,3 +11,4 @@ ansible/vars.yml
 
 # Per-service secrets — hold real values; commit the *.env.example templates instead.
 container_env_files/*.env
+container_env_files_backup/
