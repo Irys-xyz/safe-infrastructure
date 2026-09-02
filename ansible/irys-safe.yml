@@ -473,7 +473,6 @@
               -e '^SECRET_KEY=insecure_key_for_dev$'
               -e "^DJANGO_SECRET_KEY=('|\")?Very-secure-secret-string"
               -e '^(AUTH_TOKEN|CGW_AUTH_TOKEN)=your_privileged_endpoints_token$'
-              -e '^(CSV_)?AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)=dummy$'
               {{ irys_env_files_list | join(' ') }}
               || true
           args:
@@ -481,14 +480,33 @@
           register: irys_weak_defaults
           changed_when: false
 
+        - name: WARN — known-weak upstream defaults are still in place
+          ansible.builtin.debug:
+            msg: |-
+              container_env_files/*.env still contain values published in the upstream
+              repository. Deferred because irys_accept_default_credentials is set. Rotate
+              these — note that for the admin passwords, editing the env file is NOT enough:
+              the services only read them when first creating the account, so the existing
+              password must be changed in the service itself (RUNBOOK section 10).
+
+              {{ irys_weak_defaults.stdout }}
+          when:
+            - irys_weak_defaults.stdout | trim | length > 0
+            - irys_accept_default_credentials | default(false)
+
         - name: Fail if any known-weak upstream default is still in place
           ansible.builtin.assert:
             that: irys_weak_defaults.stdout | trim | length == 0
             fail_msg: |-
               container_env_files/*.env still contain the upstream repo's public dev defaults.
-              These are published in git history and must be rotated before any deployment:
+              These are published in git history, so treat them as compromised:
 
               {{ irys_weak_defaults.stdout }}
+
+              Rotate them, or set irys_accept_default_credentials: true to defer with a
+              warning (RUNBOOK section 10 has the procedure — for admin passwords the env
+              file alone is not enough, the account already exists).
+          when: not (irys_accept_default_credentials | default(false))
 
         - name: Enable and start the stack (first run pulls images + builds the UI)
           ansible.builtin.systemd_service:
