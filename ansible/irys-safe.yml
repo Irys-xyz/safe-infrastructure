@@ -84,6 +84,8 @@
     xdg_env:
       XDG_RUNTIME_DIR: "/run/user/{{ stack_uid }}"
       DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ stack_uid }}/bus"
+    # The five per-service secret files, provisioned out-of-band on the host.
+    irys_env_files_list: [cfg.env, cgw.env, txs.env, events.env, ui.env]
 
     apt_packages:
       - podman
@@ -119,9 +121,22 @@
         that:
           - irys_action in ['install', 'start', 'stop', 'restart', 'status']
           - stack_user is defined and stack_user | length > 0
+          # Infrastructure credentials are single-sourced into the repo-root .env, so they are
+          # gated here rather than in the per-service env files (where the same values are inert
+          # and overridden by docker-compose.yml).
+          - irys_action != 'install' or (irys_postgres_password is defined
+              and irys_postgres_password | length >= 16
+              and irys_postgres_password != 'CHANGE_ME'
+              and irys_postgres_password != 'postgres')
+          - irys_action != 'install' or (irys_rabbitmq_password is defined
+              and irys_rabbitmq_password | length >= 16
+              and irys_rabbitmq_password != 'CHANGE_ME'
+              and irys_rabbitmq_password != 'guest')
         fail_msg: >-
-          Set stack_user. irys_action must be one of install, start, stop,
-          restart, status.
+          Set stack_user, and (for install) irys_postgres_password and
+          irys_rabbitmq_password to vaulted values of at least 16 characters --
+          not CHANGE_ME, and not the upstream defaults 'postgres' / 'guest'.
+          irys_action must be one of install, start, stop, restart, status.
 
   tasks:
     # --- install: system preparation (root) -------------------------------
@@ -341,12 +356,7 @@
         - name: Stat the per-service secret files (not synced — must exist on the host)
           ansible.builtin.stat:
             path: "{{ irys_dir }}/container_env_files/{{ item }}"
-          loop:
-            - cfg.env
-            - cgw.env
-            - txs.env
-            - events.env
-            - ui.env
+          loop: "{{ irys_env_files_list }}"
           register: irys_env_files
 
         - name: Fail clearly if any per-service secret file is missing
@@ -358,6 +368,64 @@
               container_env_files/*.env are gitignored and no longer synced by this playbook.
               Provision them on the host first — copy each container_env_files/*.env.example to
               *.env and fill the __CHANGE_ME__ / __PASSWORD__ placeholders — then re-run.
+
+        # A missing file is caught above; an UNFILLED one is worse, because it boots the stack
+        # with a publicly-known Django SECRET_KEY / CGW AUTH_TOKEN. The Config Service admin can
+        # rewrite chain 3282's contract addresses, RPC and transaction-service URLs — i.e. what
+        # the wallet asks owners to sign — so these gates run before the stack is ever started.
+        # __SAFE_DOMAIN__ is deliberately not checked: this playbook fills it in itself below.
+        - name: Scan the env files for unfilled placeholders
+          ansible.builtin.shell:
+            cmd: >-
+              grep -HnF
+              -e '__CHANGE_ME__'
+              -e '__PASSWORD__'
+              -e '__USER__'
+              {{ irys_env_files_list | join(' ') }}
+              || true
+          args:
+            chdir: "{{ irys_dir }}/container_env_files"
+          register: irys_placeholders
+          changed_when: false
+
+        - name: Fail if any placeholder is still unfilled
+          ansible.builtin.assert:
+            that: irys_placeholders.stdout | trim | length == 0
+            fail_msg: |-
+              Unfilled placeholders remain in container_env_files/*.env on the host.
+              Replace every __CHANGE_ME__ / __USER__ / __PASSWORD__ with a real value
+              (generate secrets with `openssl rand -hex 32`) before deploying:
+
+              {{ irys_placeholders.stdout }}
+
+        # The placeholders above are this fork's; these are the upstream repo's committed dev
+        # defaults, which are just as public. Catch them whether they arrived by copying an
+        # older checkout's *.env or by editing only some of the fields.
+        - name: Scan the env files for known-weak upstream defaults
+          ansible.builtin.shell:
+            cmd: >-
+              grep -HnE
+              -e '^ADMIN_PASSWORD=password$'
+              -e '^DJANGO_SUPERUSER_PASSWORD=admin$'
+              -e '^SECRET_KEY=insecure_key_for_dev$'
+              -e "^DJANGO_SECRET_KEY=('|\")?Very-secure-secret-string"
+              -e '^(AUTH_TOKEN|CGW_AUTH_TOKEN)=your_privileged_endpoints_token$'
+              -e '^(CSV_)?AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)=dummy$'
+              {{ irys_env_files_list | join(' ') }}
+              || true
+          args:
+            chdir: "{{ irys_dir }}/container_env_files"
+          register: irys_weak_defaults
+          changed_when: false
+
+        - name: Fail if any known-weak upstream default is still in place
+          ansible.builtin.assert:
+            that: irys_weak_defaults.stdout | trim | length == 0
+            fail_msg: |-
+              container_env_files/*.env still contain the upstream repo's public dev defaults.
+              These are published in git history and must be rotated before any deployment:
+
+              {{ irys_weak_defaults.stdout }}
 
         - name: Enable and start the stack (first run pulls images + builds the UI)
           ansible.builtin.systemd_service:

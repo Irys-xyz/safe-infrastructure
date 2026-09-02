@@ -12,3 +12,11 @@ ansible/vars.yml
 # Per-service secrets — hold real values; commit the *.env.example templates instead.
 container_env_files/*.env
 container_env_files_backup/
+
+# Isolated copy of the repo used by scripts/upgrade_test.sh (never commit)
+.upgrade-test/
+
+# Records which image versions the production host runs — an inventory of the live
+# deployment, so it stays out of a public repo. Generate it with:
+#   scripts/upgrade_test.sh probe-host <stack-user>@<host> > versions/deployed.env
+versions/deployed.env

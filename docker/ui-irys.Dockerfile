@@ -28,10 +28,25 @@
 #   podman build -t localhost/safe-wallet-web-irys:3282 \
 #     --build-arg NEXT_PUBLIC_GATEWAY_URL_PRODUCTION=https://safe.irys.xyz/cgw \
 #     -f docker/ui-irys.Dockerfile .
-FROM docker.io/safeglobal/safe-wallet-web:latest
+# Base image. Defaults to the mutable :latest tag; PIN IT TO A DIGEST for production, since
+# this image is the code that builds, decodes and displays the transactions owners sign:
+#   --build-arg UI_BASE_IMAGE=docker.io/safeglobal/safe-wallet-web@sha256:<digest>
+# scripts/pin_image_digests.sh prints the digest of what you currently have pulled.
+ARG UI_BASE_IMAGE=docker.io/safeglobal/safe-wallet-web:latest
+FROM ${UI_BASE_IMAGE}
+
+# Re-declare inside the stage (pre-FROM ARGs are not in scope) and record it on the image, so
+# scripts/run_locally_podman.sh can tell a base-image change from a no-op and force a rebuild.
+ARG UI_BASE_IMAGE
+LABEL irys.base-image="${UI_BASE_IMAGE}"
 
 # Patch chain 3282 into the bundled safe-deployments data. Must precede the build so the
 # static export bundles the Irys addresses.
+# Chain id baked into this image: registered in the bundled safe-deployments AND used as the
+# UI's default chain. 3282 is Irys Mainnet (production). A local fork can be built with a
+# different id so it does not collide with the real network in a browser wallet (RUNBOOK s13).
+ARG IRYS_CHAIN_ID=3282
+ENV IRYS_CHAIN_ID=$IRYS_CHAIN_ID
 COPY docker/patch-irys-deployments.mjs /tmp/patch-irys-deployments.mjs
 RUN node /tmp/patch-irys-deployments.mjs
 
@@ -44,18 +59,23 @@ RUN node /tmp/patch-irys-deployments.mjs
 COPY docker/patch-safe-versions.mjs /tmp/patch-safe-versions.mjs
 RUN node /tmp/patch-safe-versions.mjs
 
+# NEXT_PUBLIC_SAFE_VERSION feeds the wallet's LATEST_SAFE_VERSION, used on the create-Safe path
+# and for upgrade prompts. It MUST be 1.5.0 here: v1.5.0 is the only Safe version deployed on Irys
+# and the only one patch-irys-deployments.mjs registers for chain 3282, so leaving the upstream
+# default of 1.4.1 would make the UI ask for a deployment that does not exist on this chain.
+#
 # Deployment config baked into the static export. Defaults mirror container_env_files/ui.env;
 # override with --build-arg. These NEXT_PUBLIC_* values are inlined by `next build` and cannot
 # be changed at runtime afterwards. The other NEXT_PUBLIC_* keys in ui.env (Infura, Tenderly,
 # Sentry, Beamer, ...) are empty by default and omitted here; to bake one, add it to this block.
 ARG NEXT_PUBLIC_GATEWAY_URL_PRODUCTION=/cgw
-ARG NEXT_PUBLIC_DEFAULT_MAINNET_CHAIN_ID=3282
+ARG NEXT_PUBLIC_DEFAULT_MAINNET_CHAIN_ID=$IRYS_CHAIN_ID
 ARG NEXT_PUBLIC_WC_PROJECT_ID=
 ENV NEXT_PUBLIC_GATEWAY_URL_PRODUCTION=$NEXT_PUBLIC_GATEWAY_URL_PRODUCTION \
     NEXT_PUBLIC_DEFAULT_MAINNET_CHAIN_ID=$NEXT_PUBLIC_DEFAULT_MAINNET_CHAIN_ID \
     NEXT_PUBLIC_WC_PROJECT_ID=$NEXT_PUBLIC_WC_PROJECT_ID \
     NEXT_PUBLIC_IS_PRODUCTION=true \
-    NEXT_PUBLIC_SAFE_VERSION=1.4.1
+    NEXT_PUBLIC_SAFE_VERSION=1.5.0
 
 WORKDIR /app/apps/web
 

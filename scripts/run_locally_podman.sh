@@ -49,19 +49,24 @@ ensure_images() {
   UI_REBUILT=0
   local ui_img=localhost/safe-wallet-web-irys:3282
   local ui_gw="${UI_GATEWAY_URL:-/cgw}"
-  local ui_baked
+  local ui_base="${UI_BASE_IMAGE:-docker.io/safeglobal/safe-wallet-web:latest}"
+  local ui_baked ui_baked_base
   ui_baked=$(podman image inspect "$ui_img" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
                | sed -n 's/^NEXT_PUBLIC_GATEWAY_URL_PRODUCTION=//p')
-  if [ "$ui_baked" != "$ui_gw" ]; then
-    echo "    building  $ui_img (gateway $ui_gw)"
+  # Rebuild on a base-image change too, not just a gateway change: repinning UI_BASE_IMAGE to a
+  # new digest must actually rebuild, or the stack keeps serving the previously baked bundle.
+  ui_baked_base=$(podman image inspect "$ui_img" --format '{{index .Labels "irys.base-image"}}' 2>/dev/null)
+  if [ "$ui_baked" != "$ui_gw" ] || [ "$ui_baked_base" != "$ui_base" ]; then
+    echo "    building  $ui_img (gateway $ui_gw, base $ui_base)"
     if podman build -t "$ui_img" --build-arg "NEXT_PUBLIC_GATEWAY_URL_PRODUCTION=$ui_gw" \
+         --build-arg "UI_BASE_IMAGE=$ui_base" \
          -f docker/ui-irys.Dockerfile .; then
       UI_REBUILT=1
     else
       echo "    WARN: failed to build the custom UI image"
     fi
   else
-    echo "    present  $ui_img (gateway $ui_gw)"
+    echo "    present  $ui_img (gateway $ui_gw, base $ui_base)"
   fi
   $COMPOSE config 2>/dev/null | awk '$1=="image:"{print $2}' | sort -u | while read -r img; do
     [ -n "$img" ] || continue
@@ -179,6 +184,6 @@ for u in /cfg/api/v1/about/ /txs/api/v1/about/ /cgw/about /; do
 done
 
 echo
-echo "Done. Wallet UI at http://localhost:8080  (admin/APIs at http://localhost:${PORT})"
+echo "Done. Wallet UI and APIs at http://localhost:${PORT}/ (loopback only — the public entry point is the host's Caddy TLS proxy)."
 echo "If the UI is blank/502, give the stack a few seconds to settle, then reload (see RUNBOOK §11 if it persists)."
 echo "Chain 3282, the v1.5.0 contracts, the WALLET_WEB service, and the Events webhook were configured automatically."
