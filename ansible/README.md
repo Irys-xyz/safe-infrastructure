@@ -34,11 +34,18 @@ cp vars.example.yml vars.yml                # set stack_user, RPC, version pins
 ansible-vault encrypt_string 's3cret' --name irys_cfg_superuser_password   # vault any secrets
 ```
 
-The playbook deploys this working copy to the host with **rsync**
-(`ansible.posix.synchronize`), shipping your local tree as-is — uncommitted changes
-included, no git push needed. It excludes `.git`, `data/`, `.env`, `claude/`, and the
-Ansible local files, then chowns the tree to `stack_user`. Override the source with
-`irys_src_dir` to push a different checkout.
+The playbook checks out a **pinned revision from the remote** (`irys_repo_url`,
+`irys_repo_version`) as `stack_user`, and writes the deployed SHA to
+`DEPLOYED_REVISION` in the deploy directory — so the host can answer what it is running.
+Only reviewed, pushed commits can reach production, and a hand-edit on the host **fails
+the deploy** rather than being silently overwritten (resolve it, do not `--force`).
+Gitignored files (`.env`, `container_env_files/*.env`, `data/`) are untouched by a
+checkout, so they survive.
+
+Set `irys_deploy_method: rsync` to push your working copy instead, uncommitted changes
+included (`irys_src_dir` selects the source). That is useful for iterating against a
+test host and unsuitable for production: the deployed artifact has no identity, and
+anything uncommitted on your machine becomes live.
 
 ## Run
 

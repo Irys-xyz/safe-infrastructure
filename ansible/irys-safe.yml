@@ -77,7 +77,16 @@
     subid_start: 100000
     subid_count: 65536
 
-    # Local working copy pushed to the host (repo root = the Ansible dir's parent).
+    # How the code reaches the host.
+    #   git   (default) check out a pinned revision from the remote. The host then records
+    #         what it is running, and only reviewed, pushed commits can be deployed.
+    #   rsync push this working copy as-is, uncommitted changes included. Convenient for
+    #         iterating against a test host; unsuitable for production, because the
+    #         deployed artifact has no identity and anything uncommitted becomes live.
+    irys_deploy_method: git
+    irys_repo_url: https://github.com/Irys-xyz/safe-infrastructure.git
+    irys_repo_version: main
+    # Local working copy, used only by the rsync method (repo root = the Ansible dir's parent).
     irys_src_dir: "{{ playbook_dir | dirname }}"
     # Derived from the resolved stack user (lazy-evaluated once stack_* are set).
     irys_dir: "{{ stack_home }}/irys-safe-infrastructure"
@@ -103,6 +112,7 @@
       - aardvark-dns
       - fuse-overlayfs
       - rsync
+      - git
       - curl
       - acl
       # Edge hardening: TLS reverse proxy (Caddy), host firewall (nftables), and an SSH
@@ -309,6 +319,36 @@
             HOME: "{{ stack_home }}"
             PATH: "{{ stack_home }}/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
+        - name: Check out the pinned revision on the host
+          ansible.builtin.git:
+            repo: "{{ irys_repo_url }}"
+            dest: "{{ irys_dir }}"
+            version: "{{ irys_repo_version }}"
+            # Refuse to discard local modifications rather than silently clobbering them.
+            # A dirty tree means someone edited the host directly; that needs a human, not
+            # a --force. Gitignored files (.env, container_env_files/*.env, data/) are
+            # untouched by a checkout, so they survive.
+            force: false
+          become: true
+          become_user: "{{ stack_user }}"
+          when: irys_deploy_method == 'git'
+          register: irys_git
+          notify: Restart irys-safe stack
+
+        - name: Record what was deployed
+          ansible.builtin.copy:
+            dest: "{{ irys_dir }}/DEPLOYED_REVISION"
+            content: |
+              revision={{ irys_git.after | default('unknown') }}
+              requested={{ irys_repo_version }}
+              repo={{ irys_repo_url }}
+              deployed_at={{ ansible_date_time.iso8601 | default('unknown') }}
+              method=git
+            owner: "{{ stack_user }}"
+            group: "{{ stack_user }}"
+            mode: "0644"
+          when: irys_deploy_method == 'git'
+
         - name: Sync the working copy to the host (rsync)
           ansible.posix.synchronize:
             src: "{{ irys_src_dir }}/"
@@ -323,20 +363,18 @@
               - "--exclude=.env"
               - "--exclude=claude"
               - "--exclude=.idea"
+              - "--exclude=.upgrade-test"
+              - "--exclude=backups"
               - "--exclude=ansible/inventory.ini"
               - "--exclude=ansible/vars.yml"
+              - "--exclude=versions/deployed.env"
               # Per-service secrets are gitignored and provisioned out-of-band; the *.env.example
               # templates still sync. Place container_env_files/*.env on a fresh host before start.
               - "--exclude=container_env_files/*.env"
           become: false
+          when: irys_deploy_method == 'rsync'
           notify: Restart irys-safe stack
 
-        # Re-own the rsynced code tree to the stack user, but never recurse into ./data.
-        # The postgres subdirs there are chowned to container uid 70 (mapped through the
-        # rootless userns); a blanket `chown -R {{ irys_dir }}` would re-map them to the stack
-        # user (= container root), postgres would lose access to its own files, and every *-db
-        # container would crash-loop on the next install. rsync already excludes ./data, so
-        # podman alone owns what lives under it -- prune it from the chown.
         - name: Ensure the deployed tree (excluding ./data) is owned by the stack user
           ansible.builtin.command:
             argv:

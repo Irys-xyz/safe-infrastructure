@@ -6,6 +6,15 @@ stack_user: irys                 # unprivileged user that owns + runs the stack 
                                  # Recommended: also your ansible_user, so the rsync deploy
                                  # lands writable by the stack.
 
+# --- how the code reaches the host ---
+# git (default) checks out a pinned revision and records it in DEPLOYED_REVISION. Pin a tag
+# or SHA for production rather than a branch, so a deploy is reproducible.
+irys_repo_version: main
+# irys_repo_url: https://github.com/Irys-xyz/safe-infrastructure.git
+# Set to rsync to push your local working copy instead — uncommitted changes included.
+# Fine for a test host, not for production.
+# irys_deploy_method: rsync
+
 # --- stack config ---
 irys_rpc_node_url: https://mainnet-beta-rpc.irys.xyz/v1/execution-rpc
 irys_reverse_proxy_port: 8000
