@@ -123,22 +123,47 @@
           - stack_user is defined and stack_user | length > 0
           # Infrastructure credentials are single-sourced into the repo-root .env, so they are
           # gated here rather than in the per-service env files (where the same values are inert
-          # and overridden by docker-compose.yml).
-          - irys_action != 'install' or (irys_postgres_password is defined
+          # and overridden by docker-compose.yml). Set irys_accept_default_credentials=true to
+          # deploy against a host whose databases still hold the upstream defaults and rotate
+          # later -- see the warning it prints, and RUNBOOK section 10 for the rotation.
+          - irys_action != 'install' or irys_accept_default_credentials | default(false)
+              or (irys_postgres_password is defined
               and irys_postgres_password | length >= 16
               and irys_postgres_password != 'CHANGE_ME'
               and irys_postgres_password != 'postgres')
-          - irys_action != 'install' or (irys_rabbitmq_password is defined
+          - irys_action != 'install' or irys_accept_default_credentials | default(false)
+              or (irys_rabbitmq_password is defined
               and irys_rabbitmq_password | length >= 16
               and irys_rabbitmq_password != 'CHANGE_ME'
               and irys_rabbitmq_password != 'guest')
+          # Even with the opt-out, the values must be set to *something* -- compose feeds them
+          # to both the servers and the clients, and an empty password stops Postgres starting.
+          - irys_action != 'install' or (irys_postgres_password is defined
+              and irys_postgres_password | length > 0)
+          - irys_action != 'install' or (irys_rabbitmq_password is defined
+              and irys_rabbitmq_password | length > 0)
         fail_msg: >-
           Set stack_user, and (for install) irys_postgres_password and
           irys_rabbitmq_password to vaulted values of at least 16 characters --
           not CHANGE_ME, and not the upstream defaults 'postgres' / 'guest'.
+          To deploy against a host whose databases still hold the upstream
+          defaults and rotate afterwards, set the existing values and add
+          irys_accept_default_credentials: true (RUNBOOK section 10).
           irys_action must be one of install, start, stop, restart, status.
 
   tasks:
+    - name: WARN — deploying with default infrastructure credentials
+      ansible.builtin.debug:
+        msg: >-
+          irys_accept_default_credentials is set, so the credential strength check was
+          skipped. The databases and message broker are reachable with credentials
+          published in the upstream repository. This is survivable only because they sit
+          on a private container network with no published ports — any code execution
+          inside that network reaches all four databases. Rotate as soon as the urgent
+          work is done: RUNBOOK section 10 (it needs ALTER USER inside each database and
+          a broker recreate, not just an edit here).
+      when: irys_accept_default_credentials | default(false)
+
     # --- install: system preparation (root) -------------------------------
     - name: System preparation
       when: irys_action == 'install'

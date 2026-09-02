@@ -376,6 +376,14 @@ time per the note above.
   `SECRET_KEY` (cfg), the database passwords, `AUTH_TOKEN` / `CGW_AUTH_TOKEN` (must match),
   Events `ADMIN_PASSWORD`, `DJANGO_SUPERUSER_PASSWORD`, `JWT_SECRET`, `FINGERPRINT_ENCRYPTION_KEY`.
 
+- **Deferring the rotation.** If you need to ship other changes before rotating, set
+  `irys_postgres_password` / `irys_rabbitmq_password` to the values the host **already**
+  uses and add `irys_accept_default_credentials: true`. The play then skips the strength
+  check and prints a warning on every run. Do this knowingly: the upstream defaults are
+  published, so the databases and broker accept publicly-known credentials. They are only
+  survivable because they sit on a private container network with no published ports — any
+  code execution inside that network reaches all four databases.
+
 - **Rotating the Postgres passwords takes three steps, not one.** This is the one that bites:
   the database password lives in *two* places that must agree, and editing either alone breaks
   the stack.

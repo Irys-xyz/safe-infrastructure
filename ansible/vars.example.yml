@@ -51,6 +51,14 @@ irys_postgres_password: CHANGE_ME
 irys_rabbitmq_user: safe
 irys_rabbitmq_password: CHANGE_ME
 
+# Deploying against an EXISTING host whose databases still hold the upstream defaults?
+# Postgres only reads POSTGRES_PASSWORD at initdb and RabbitMQ only reads its default
+# credentials on first boot, so a new password here does not change what they accept --
+# every service would fail to authenticate. To ship other changes now and rotate later,
+# set the values above to what the host already uses and uncomment this. It prints a loud
+# warning on every deploy, deliberately. Rotation procedure: RUNBOOK section 10.
+# irys_accept_default_credentials: true
+
 # --- optional: auto-create admin users on first start (vault the passwords) ---
 # irys_cfg_superuser_username: root
 # irys_cfg_superuser_email: admin@irys.xyz
