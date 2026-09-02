@@ -86,10 +86,11 @@ irys_origin_key: |
 # list in irys-safe.yml is the fallback).
 # irys_cloudflare_fetch_ips: true
 
-# Authenticated Origin Pulls (zone-level mTLS): Caddy requires Cloudflare's client certificate,
-# so the origin rejects anything that is not Cloudflare — even from within CF's IP ranges. ENABLE
-# it in the Cloudflare dashboard (SSL/TLS -> Origin Server -> Authenticated Origin Pulls, zone-
-# level) BEFORE deploying, or the site goes dark. Set false to skip the mTLS requirement.
+# Authenticated Origin Pulls (zone-level mTLS): Cloudflare presents the zone's own Origin CA
+# certificate (the irys_origin_cert above) as its client certificate, and Caddy pins that exact
+# leaf — so the origin rejects anything that is not Cloudflare, even from within CF's IP ranges.
+# ENABLE it in the Cloudflare dashboard (SSL/TLS -> Origin Server -> Authenticated Origin Pulls,
+# zone-level) BEFORE deploying, or the site goes dark. Set false to skip the mTLS requirement.
 # irys_cf_authenticated_origin_pull: true
 
 # Disable SSH password authentication (key-only). root already has a key; the irys stack user

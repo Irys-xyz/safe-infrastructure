@@ -26,17 +26,24 @@ http://{{ irys_safe_domain }} {
 
 https://{{ irys_safe_domain }} {
 {% if irys_cf_authenticated_origin_pull | default(true) %}
-    # Authenticated Origin Pulls (zone-level mTLS): only accept a connection presenting a client
-    # certificate signed by Cloudflare's origin-pull CA, so even a host inside Cloudflare's IP
-    # ranges cannot reach the origin without Cloudflare's own client cert. ENABLE it in the
-    # Cloudflare dashboard (SSL/TLS -> Origin Server -> Authenticated Origin Pulls) BEFORE
-    # deploying this, or Caddy rejects every connection and the site goes dark.
+    # Authenticated Origin Pulls (zone-level mTLS): Cloudflare presents the zone's own Origin CA
+    # certificate -- this host's origin.crt -- as its client certificate, so pin that exact leaf.
+    # (Observed live 2026-06-11: client cert serial equals the served origin cert's serial; the
+    # legacy shared origin-pull.cloudflare.net CA is no longer what signs zone-level pulls.)
+    # Trusting the issuing CA instead would admit any Cloudflare customer's origin certificate,
+    # since the Origin CA is shared across tenants. The pin derives from irys_origin_cert, so a
+    # certificate rotation in vars.yml updates the served cert and the pin together. ENABLE AOP
+    # in the Cloudflare dashboard (SSL/TLS -> Origin Server -> Authenticated Origin Pulls)
+    # BEFORE deploying this, or Caddy rejects every connection and the site goes dark.
+    # Mode is `require`, not `require_and_verify`: the latter runs Go's CA-pool verification,
+    # which has no pool here and rejects every handshake (x509: unknown authority) before the
+    # leaf pin is consulted. `require` demands a certificate and the pinned-leaf check below
+    # rejects any that is not byte-identical (verified live: no cert and a self-signed cert
+    # both get TLS alerts; only the pinned cert completes the handshake).
     tls {{ irys_origin_cert_path }} {{ irys_origin_key_path }} {
         client_auth {
-            mode require_and_verify
-            trust_pool file {
-                pem_file {{ irys_cf_aop_ca_path }}
-            }
+            mode require
+            trusted_leaf_cert {{ irys_origin_cert | regex_replace('-----(BEGIN|END) CERTIFICATE-----', '') | regex_replace('\\s', '') }}
         }
     }
 {% else %}

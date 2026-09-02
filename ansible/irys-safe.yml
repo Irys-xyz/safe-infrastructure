@@ -43,10 +43,10 @@
     irys_origin_cert_path: /etc/caddy/origin.crt
     irys_origin_key_path: /etc/caddy/origin.key
     irys_cloudflare_fetch_ips: true
-    # Authenticated Origin Pulls (zone-level mTLS): Caddy requires Cloudflare's client cert.
+    # Authenticated Origin Pulls (zone-level mTLS): Caddy pins the zone's own Origin CA cert,
+    # which Cloudflare presents as its client certificate (see Caddyfile.j2).
     # Enable it in the Cloudflare dashboard BEFORE deploying, or the origin rejects everything.
     irys_cf_authenticated_origin_pull: true
-    irys_cf_aop_ca_path: /etc/caddy/cloudflare-aop-ca.pem
     # Bundled Cloudflare ranges; refreshed from cloudflare.com at deploy when the toggle is on.
     cloudflare_ipv4:
       - 173.245.48.0/20
@@ -472,15 +472,10 @@
           no_log: true
           notify: Reload caddy
 
-        - name: Install the Cloudflare Authenticated-Origin-Pull CA certificate
-          ansible.builtin.copy:
-            src: "{{ playbook_dir }}/files/cloudflare-aop-ca.pem"
-            dest: "{{ irys_cf_aop_ca_path }}"
-            owner: root
-            group: caddy
-            mode: "0644"
-          when: irys_cf_authenticated_origin_pull | default(true)
-          notify: Reload caddy
+        - name: Remove the legacy Cloudflare origin-pull CA (AOP now pins the leaf certificate)
+          ansible.builtin.file:
+            path: /etc/caddy/cloudflare-aop-ca.pem
+            state: absent
 
         - name: Install the Caddy reverse-proxy config
           ansible.builtin.template:
