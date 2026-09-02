@@ -1,0 +1,83 @@
+# Local-chain overlay: run the whole Safe stack against an anvil fork of Irys Mainnet instead
+# of the real chain. See RUNBOOK section 13.
+#
+# Why a *fork* rather than a fresh chain: Safe's canonical contracts are deployed at
+# deterministic CREATE2 addresses, and a bare anvil has none of them. Forking Irys means all 13
+# v1.5.0 contracts are already present at exactly the addresses this stack is configured with,
+# so nothing else has to change -- no redeployment, no address overrides, no rebuilt UI image.
+# The fork keeps chain id 3282, so the config service, the deployments patch and the baked
+# NEXT_PUBLIC_DEFAULT_MAINNET_CHAIN_ID all stay correct.
+#
+# Usage (from the repo root, with a .env that sets the two RPC vars -- see RUNBOOK section 13):
+#   docker compose -f docker-compose.yml -f docker-compose.local-chain.yml up -d anvil
+#   bash scripts/run_locally_podman.sh
+#
+# Writes are local and disposable: `docker compose ... down` throws the forked state away.
+# Nothing you do here can touch Irys Mainnet -- anvil never broadcasts.
+
+services:
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    restart: unless-stopped
+    environment:
+      LOCAL_FORK_RPC: ${LOCAL_FORK_RPC:-https://mainnet-beta-rpc.irys.xyz/v1/execution-rpc}
+      # Pin the fork block for a reproducible starting state. Leave unset to fork at the tip.
+      # (Built as a shell arg rather than a compose list entry because the flag must be OMITTED
+      # when unpinned -- passing --fork-block-number=0 would fork at genesis, where none of the
+      # Safe contracts exist yet, which is the opposite of what this overlay is for.)
+      LOCAL_FORK_BLOCK: ${LOCAL_FORK_BLOCK:-}
+      # Blocks to stay behind the tip when LOCAL_FORK_BLOCK is unset. Matches
+      # scripts/local_testnet.sh, which uses the same default.
+      LOCAL_FORK_LAG: ${LOCAL_FORK_LAG:-10}
+      # Chain id the fork serves. Default 3282 (Irys Mainnet). Set it to something else so the
+      # fork does not collide with the real Irys network already in a browser wallet, and build
+      # the UI image with the same IRYS_CHAIN_ID (it is baked in).
+      IRYS_CHAIN_ID: ${IRYS_CHAIN_ID:-3282}
+      # Seconds between blocks. Default 9 to match measured Irys Mainnet (~8.8 s/block), so
+      # confirmation timing behaves like the real chain. MUST be set at all: by default anvil
+      # only mines when a transaction
+      # arrives, so the chain head freezes the instant a transaction is included. Anything
+      # waiting for confirmations *after* inclusion then hangs forever -- the wallet's
+      # "Activating your account" step does exactly that, and never completes. A real chain
+      # produces blocks continuously, so mine on an interval to match it.
+      LOCAL_BLOCK_TIME: ${LOCAL_BLOCK_TIME:-9}
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        # Deterministic funded test accounts: same keys every run.
+        # NEVER use these keys anywhere real -- they are published in anvil's source.
+        ARGS="--fork-url=$${LOCAL_FORK_RPC} --chain-id=$${IRYS_CHAIN_ID} --host=0.0.0.0 --accounts=10 --balance=10000 --block-time $${LOCAL_BLOCK_TIME}"
+        PIN="$${LOCAL_FORK_BLOCK}"
+        if [ "$${PIN}" = tip ]; then
+          # Explicitly unpinned: anvil resolves the tip itself. Different block every run.
+          echo "forking at current tip (unpinned - not reproducible)"
+          PIN=""
+        elif [ -z "$${PIN}" ]; then
+          # Resolve a concrete block so the run is repeatable, and stay a little behind the
+          # tip: the newest block is the least reliable to fork (state may not have settled,
+          # and it can still be reorged away).
+          TIP=$$(cast block-number --rpc-url "$${LOCAL_FORK_RPC}" 2>/dev/null || echo "")
+          if [ -n "$${TIP}" ]; then
+            PIN=$$(( TIP - LOCAL_FORK_LAG ))
+            [ "$${PIN}" -lt 1 ] && PIN=1
+            echo "forking at block $${PIN} (tip $${TIP} minus LOCAL_FORK_LAG=$${LOCAL_FORK_LAG})"
+            echo "  set LOCAL_FORK_BLOCK=$${PIN} to reproduce this exact state"
+          else
+            echo "WARN: could not read the tip - forking unpinned" >&2
+          fi
+        else
+          echo "forking at pinned block $${PIN}"
+        fi
+        [ -n "$${PIN}" ] && ARGS="$$ARGS --fork-block-number=$${PIN}"
+        exec anvil $$ARGS
+    ports:
+      # Loopback only: the browser and MetaMask reach the chain here. Services use anvil:8545.
+      # Parameterised so two forks can run side by side (e.g. an interactive test chain and an
+      # upgrade rehearsal) without colliding on the published port.
+      - "127.0.0.1:${LOCAL_CHAIN_PORT:-8546}:8545"
+    healthcheck:
+      test: ["CMD", "cast", "block-number", "--rpc-url", "http://localhost:8545"]
+      interval: 5s
+      timeout: 5s
+      retries: 12

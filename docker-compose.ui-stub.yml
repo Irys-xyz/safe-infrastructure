@@ -1,0 +1,22 @@
+# Replaces the wallet UI with a trivial placeholder.
+#
+# nginx resolves every upstream in nginx.conf at startup and refuses to start if any name is
+# unresolvable ("host not found in upstream"), so the `ui` service has to exist even when you
+# are only exercising the backend. Building the real UI image takes several minutes and a
+# 4-8 GiB `next build`, which is wasted work when rehearsing a database migration.
+#
+# Use it for backend-only work (scripts/upgrade_test.sh does by default):
+#   docker compose -f docker-compose.yml -f docker-compose.local-chain.yml \
+#                  -f docker-compose.ui-stub.yml up -d
+#
+# Drop this overlay when you need to test the wallet itself.
+services:
+  ui:
+    image: docker.io/library/busybox:1.36
+    restart: unless-stopped
+    # Serves an empty directory on 8080: enough for nginx to resolve and connect to it.
+    command: ["sh", "-c", "mkdir -p /www && echo 'ui stub' > /www/index.html && httpd -f -p 8080 -h /www"]
+    build: !reset null
+    env_file: !reset []
+    expose:
+      - 8080
