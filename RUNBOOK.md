@@ -820,8 +820,8 @@ Then, in order:
 4. Reload nginx and flush the txs Redis (§14).
 
 Verified end to end in the rehearsal: after rolling back from
-txs v6.10.1 / cfg v2.96.1 / cgw v1.115.0 to v6.4.0 / v2.95.0 / v1.112.0, the migration counts
-returned to their pre-upgrade values and the indexed Safe was still present.
+a newer version set to the previous one, the migration counts returned to their pre-upgrade
+values and the indexed Safe was still present.
 
 ### Consistency
 
