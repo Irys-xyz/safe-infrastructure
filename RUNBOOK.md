@@ -26,29 +26,48 @@ Nothing else is required to boot locally.
 
 ### Security note (read once)
 
-`container_env_files/*.env` are **tracked by git** in this repo. This scaffold writes real secrets into
-them (see table below). For local use this is fine. **Do not push this clone anywhere with those secrets
-committed.** Before any remote/production deployment, rotate every secret and move them out of version
-control (e.g. an untracked `.env` / secrets manager).
+`container_env_files/*.env` hold real secrets and are **gitignored**. Only the `*.env.example`
+templates are committed, and they carry `__CHANGE_ME__` / `__USER__` / `__PASSWORD__` placeholders
+rather than values. Provision the real files out-of-band on the host:
+
+```bash
+cd container_env_files
+for f in cfg cgw txs events ui; do cp $f.env.example $f.env; done
+# then fill every placeholder — generate secrets with: openssl rand -hex 32
+```
+
+The Ansible deploy does **not** sync these files, and refuses to start the stack if any is
+missing, still contains a placeholder, or still contains one of the upstream repo's public dev
+defaults (`insecure_key_for_dev`, `postgres`, `admin`, `guest:guest`, …). Those defaults are
+published in this repo's git history, so treat them as compromised, not merely weak.
+
+Why this is strict: the Config Service's `SECRET_KEY` signs its admin sessions, and the Config
+Service admin is what defines chain 3282's contract addresses, RPC URL and transaction-service
+URL — i.e. what the wallet asks owners to sign. A guessable key there is a malicious-payload
+path, not just an information leak.
 
 ---
 
 ## 2. What was pre-configured
 
+Chain-specific settings are committed; every secret is a placeholder you must fill (§1).
+
 | File | Key | Value |
 | --- | --- | --- |
-| `.env` | `RPC_NODE_URL` | placeholder `REPLACE_WITH_IRYS_MAINNET_RPC` — **you must set this** to the public RPC in §1 |
+| `.env` (rendered by Ansible) | `RPC_NODE_URL` | the Irys RPC from §1 |
 | `container_env_files/ui.env` | `NEXT_PUBLIC_DEFAULT_MAINNET_CHAIN_ID` | `3282` |
-| `container_env_files/cgw.env` | `AUTH_TOKEN` | `<AUTH_TOKEN>` |
-| `container_env_files/cfg.env` | `CGW_AUTH_TOKEN` | `<AUTH_TOKEN>` (must match `AUTH_TOKEN`) |
-| `container_env_files/cfg.env` | `SECRET_KEY` | generated random key |
-| `container_env_files/txs.env` | `DJANGO_SECRET_KEY` | generated random key |
+| `container_env_files/ui.env` | `NEXT_PUBLIC_GATEWAY_URL_PRODUCTION` | `/cgw` (relative — same-origin, see §8) |
+| `container_env_files/cgw.env` | `AUTH_TOKEN` | `__CHANGE_ME__` — must match `cfg.env`'s `CGW_AUTH_TOKEN` |
+| `container_env_files/cfg.env` | `SECRET_KEY`, `POSTGRES_PASSWORD`, `DJANGO_SUPERUSER_PASSWORD` | `__CHANGE_ME__` |
+| `container_env_files/txs.env` | `DJANGO_SECRET_KEY`, `DATABASE_URL`, `CELERY_BROKER_URL` | `__CHANGE_ME__` / `__USER__` / `__PASSWORD__` |
+| `container_env_files/events.env` | `ADMIN_PASSWORD`, `DATABASE_URL` | `__CHANGE_ME__` / `__USER__` / `__PASSWORD__` |
 
-Image versions are left at `latest` in `.env`. After the first successful run, pin them to the exact tags
-reported by `docker images` for reproducibility.
+There are **no default credentials**: the Config Service and Transaction Service admins are created
+only if you set `*_SUPERUSER_*` in `vars.yml` / `.env`, and the Events admin password is a placeholder.
 
-Postgres passwords, the Config Service admin (`root` / `admin`), and the Events admin
-(`admin@safe` / `password`) are left at their repo defaults — fine for local, **rotate for production**.
+Image tags default to `latest`, which is fine for a first bring-up but is **not** what you should run
+against real assets — a tag is mutable, so you get whatever the registry served at first pull with no
+record of which build that was. Pin digests before anything real depends on the stack (§10).
 
 ---
 
@@ -70,7 +89,8 @@ bash scripts/run_locally_podman.sh
 ```
 
 Re-running is safe: already-running services are skipped (no recreation) and the configuration step is
-idempotent. The wallet UI is then at <http://localhost:8080/>; admin and APIs are on `:8000`.
+idempotent. The wallet UI, admin and APIs are all served on `:8000` (the earlier extra `8080` publish was
+removed: it duplicated the whole proxy, admin panels included, on a world-reachable port).
 
 The compose file (`docker-compose.yml`) and `.env` live at the repo root, where `docker compose`
 resolves them; `run_locally.sh` changes to that directory before invoking compose, so it runs correctly
@@ -84,13 +104,20 @@ thereafter the container starts in seconds.
 > `depends_on: condition: service_healthy` support, and note that rootless podman may need
 > user-namespace mapping for the `./data/*-db` Postgres bind mounts to be writable.
 
-Endpoints once up:
+Endpoints once up (all on the reverse-proxy port, default `8000`):
 
 - Web UI: <http://localhost:8000/>
-- Config admin: <http://localhost:8000/cfg/admin/> (`root` / `admin`)
-- Tx-service admin: <http://localhost:8000/txs/admin/>
-- Events admin: <http://localhost:8000/events/admin/> (`admin@safe` / `password`)
+- Config admin: <http://localhost:8000/cfg/admin/> (credentials from `CFG_SUPERUSER_*`; none by default)
+- Tx-service admin: <http://localhost:8000/txs/admin/> (credentials from `TXS_SUPERUSER_*`)
+- Events admin: <http://localhost:8000/events/admin/> (credentials from `events.env`)
 - Chains API (verify your config): <http://localhost:8000/cfg/api/v1/chains>
+
+On an Ansible-deployed host, nginx is bound to **loopback only** and the three `/*/admin*` paths are
+`403`'d at the Caddy edge. Reach an admin panel over an SSH local-forward instead:
+
+```bash
+ssh -L 8000:127.0.0.1:8000 <host>   # then browse http://localhost:8000/cfg/admin/
+```
 
 ---
 
@@ -233,8 +260,20 @@ Indexing, signing, and viewing existing Safes work regardless; the gap is only t
 
 **Implemented in this repo (option 2, lightweight).** `docker/ui-irys.Dockerfile` builds a derived image
 (`localhost/safe-wallet-web-irys:3282`) that adds chain 3282 to the bundled `@safe-global/safe-deployments`
-data: Irys uses the canonical (deterministic) deployments, so 3282 is registered with the same address as
-Ethereum mainnet for every contract (`docker/patch-irys-deployments.mjs`). The image runs `next build`
+data (`docker/patch-irys-deployments.mjs`).
+
+The patch registers **v1.5.0 `canonical` deployments only** — the 13 contracts that are actually on the
+chain. That scope is deliberate: v1.5.0 is the only Safe version deployed on Irys, and
+`scripts/verify_deployments.py` confirms the other 39 addresses across v1.0.0–v1.4.1 (including every
+v1.3.0 `eip155` variant) hold no code. Registering them would tell the wallet that contracts exist which
+do not, and the create-Safe flow would build transactions against codeless addresses. If a required
+v1.5.0 contract is missing from the bundled package, the patch **fails the image build** rather than
+shipping a UI that cannot create or execute a Safe.
+
+Note that canonical deployment is permissionless — the Safe Singleton Factory
+(`0x914d7Fec6aaC8cd542e72Bca78B30650d45643d7`) *is* present on Irys, so anyone can deploy an older Safe
+version there at any time. Re-run `scripts/verify_deployments.py` before widening the patch's scope; it
+warns when a previously-absent address gains code. The image runs `next build`
 **at image-build time** — not at container start — with the `NEXT_PUBLIC_*` config baked in, so the served
 static export already contains the patched addresses and the deployment config. The `ui` service in
 `docker-compose.yml` uses this image. Build it before bringing the stack up:
@@ -261,8 +300,17 @@ before `next build`). The patch is type-valid — `@safe-global/types-kit` alrea
 `SafeVersion` union — and the rest of the stack already supports 1.5.0: the on-chain contracts, the
 transaction service (the singleton is registered as `SafeL2 1.5.0`) and `@safe-global/safe-deployments`
 (it ships `v1.5.0` assets, which `patch-irys-deployments.mjs` maps onto chain 3282). Only the allowlist
-lagged. To verify after a rebuild, the version array adjacent to `is not a valid Safe Account version` in
-`out/_next/static/chunks/pages/_app-*.js` should start with `["1.5.0", …]`.
+lagged. To verify after a rebuild, the version array adjacent to the "not a valid Safe account version"
+assertion in `out/_next/static/chunks/pages/_app-*.js` should start with `["1.5.0", …]`. Grep
+case-insensitively: upstream changed the wording from "Safe Account" to "Safe account" after
+v1.88.0.
+
+**On newer base images this patch is a no-op, by design.** Upstream added `'1.5.0'` to
+`SAFE_VERSIONS` itself — it is present at `web-v1.99.1` and absent at `web-v1.88.0`. The script
+detects that and exits 0 with "already in allowlist, nothing to do", so it is safe to keep across
+an upgrade; keeping it also means the build still fails loudly if the declaration ever disappears
+or is renamed. `docker/patch-irys-deployments.mjs`, by contrast, is **still required**: chain 3282
+is not in `@safe-global/safe-deployments` as of 1.37.62 (2026-08-06), so PR #1555 has not landed.
 
 A second hardcoded version list lives in `determineMasterCopyVersion` (`packages/utils/src/utils/safe.ts`),
 used only by the multichain "add this Safe to another network" flow and by Safe version-upgrade parameter
@@ -323,16 +371,84 @@ time per the note above.
 
 ## 10. Production hardening (before public exposure)
 
-- **Rotate every secret**: `DJANGO_SECRET_KEY` (txs), `SECRET_KEY` (cfg), all four `POSTGRES_PASSWORD`,
-  `AUTH_TOKEN` / `CGW_AUTH_TOKEN`, Events `ADMIN_PASSWORD`, `DJANGO_SUPERUSER_PASSWORD`, `JWT_SECRET`,
-  `FINGERPRINT_ENCRYPTION_KEY`. Move them out of tracked files.
-- **TLS and domain**: the bundled nginx serves plain HTTP on `:8000`. Put a TLS-terminating proxy
-  (Caddy, Traefik, nginx) in front. Update `DJANGO_ALLOWED_HOSTS`, `CSRF_TRUSTED_ORIGINS`, `MEDIA_URL`
-  (cfg), `CGW_URL` (cfg), and `SAFE_CONFIG_BASE_URI` (cgw) to the real host — e.g. `https://safe.irys.xyz`
-  with paths `/cfg`, `/cgw`, `/txs`, `/events`. The UI's `NEXT_PUBLIC_GATEWAY_URL_PRODUCTION` stays the
-  relative `/cgw` (same-origin behind the proxy — no rebuild); give it an absolute URL only if the Client
-  Gateway is served from a different origin than the UI.
-- **Pin image versions** in `.env` instead of `latest`.
+- **Fill every secret** (§1). Ansible refuses to start the stack while a placeholder or a known
+  upstream dev default remains in `container_env_files/*.env`. The set: `DJANGO_SECRET_KEY` (txs),
+  `SECRET_KEY` (cfg), the database passwords, `AUTH_TOKEN` / `CGW_AUTH_TOKEN` (must match),
+  Events `ADMIN_PASSWORD`, `DJANGO_SUPERUSER_PASSWORD`, `JWT_SECRET`, `FINGERPRINT_ENCRYPTION_KEY`.
+
+- **Rotating the Postgres passwords takes three steps, not one.** This is the one that bites:
+  the database password lives in *two* places that must agree, and editing either alone breaks
+  the stack.
+
+  1. `POSTGRES_PASSWORD` in the repo-root `.env` — what `docker-compose.yml` gives the four
+     `*-db` containers. (It used to be hardcoded to `postgres`, which meant filling in the
+     `__CHANGE_ME__` placeholders in the service env files could only ever break the stack.)
+  2. The connecting service's own config: `POSTGRES_PASSWORD` in `cfg.env`, and the password
+     embedded in `DATABASE_URL` for `txs.env` / `events.env`.
+  3. **On an existing deployment, the database itself.** Postgres only reads
+     `POSTGRES_PASSWORD` at `initdb`. On a `./data` volume that already exists the stored
+     password does not change, so steps 1 and 2 alone leave every service unable to
+     authenticate. Change it inside the database as well:
+
+     ```bash
+     docker compose exec cfg-db psql -U postgres -c "ALTER USER postgres PASSWORD 'new';"
+     ```
+
+     Do that for each of `txs-db`, `cfg-db`, `events-db`, `cgw-db`, then update 1 and 2 to match
+     and restart. Rehearse it with `scripts/upgrade_test.sh` (§14) before doing it in place.
+
+- **RabbitMQ has the identical trap.** `RABBITMQ_DEFAULT_USER` / `RABBITMQ_DEFAULT_PASS` are only
+  read the first time the broker boots; afterwards the credentials live in its own store, and
+  changing `RABBITMQ_USER` / `RABBITMQ_PASSWORD` in `.env` just makes every client fail with
+  `ACCESS_REFUSED (403)`. The brokers in this stack have **no volume**, so their state is
+  ephemeral and recreating them adopts the new credentials:
+
+  ```bash
+  docker compose up -d --force-recreate --no-deps txs-rabbitmq general-rabbitmq
+  ```
+
+  In-flight queued messages are lost, which is acceptable for these queues (indexing work is
+  re-derived from the chain, and the CGW cache-invalidation hook is best-effort).
+- **TLS and domain** — done by the Ansible deploy (`ansible/README.md`): Caddy terminates TLS with a
+  Cloudflare Origin Certificate, nginx binds loopback only, the host firewall admits `80`/`443`
+  from Cloudflare's ranges alone, and the `/*/admin*` paths are `403`'d publicly. The playbook also
+  rewrites `DJANGO_ALLOWED_HOSTS`, `CSRF_TRUSTED_ORIGINS`, `MEDIA_URL` (cfg) and
+  `AUTH_POST_LOGIN_REDIRECT_URI` (cgw) from `irys_safe_domain`. Doing it by hand instead? Set those
+  four plus `CGW_URL` (cfg) and `SAFE_CONFIG_BASE_URI` (cgw) to the real host. The UI's
+  `NEXT_PUBLIC_GATEWAY_URL_PRODUCTION` stays the relative `/cgw` (same-origin, no rebuild); make it
+  absolute only if the Client Gateway is served from a different origin than the UI.
+- **Pin image digests, not just tags.** A tag is mutable; a digest is content-addressed. This matters
+  most for the wallet UI base image, which is the code that builds, decodes and renders what owners
+  sign. After a bring-up you have smoke-tested:
+
+  ```bash
+  bash scripts/pin_image_digests.sh          # emits ansible/vars.yml lines
+  bash scripts/pin_image_digests.sh --env    # emits .env lines
+  ```
+
+  Paste into `vars.yml` and redeploy. Each `*_DIGEST` is appended to its image reference in
+  `docker-compose.yml`, so the digest becomes authoritative and the tag stays advisory — keep the tag
+  accurate for humans, since it is no longer what resolves. Repinning `irys_ui_base_image` triggers a
+  UI rebuild and container recreate automatically.
+- **Verify the on-chain contracts** before and after any deploy, and on a schedule:
+
+  ```bash
+  python3 scripts/verify_deployments.py
+  ```
+
+  It checks, against each RPC independently, that chainId is 3282, that all 13 v1.5.0 canonical
+  addresses hold bytecode whose keccak256 matches the `codeHash` published in `safe-deployments`, and
+  that the v1.4.1/v1.3.0 singletons and proxy factories are still absent. Exit code 1 blocks a deploy.
+  Querying more than one endpoint is the point: a single RPC that lies about contract code is exactly
+  the threat. No dependencies — run it from cron or CI.
+- **Add a Content-Security-Policy** at the Caddy edge. The stack sets HSTS, `X-Frame-Options`,
+  `nosniff` and `Referrer-Policy` but no CSP, which is the main in-browser limit on injected script
+  in a signing UI. Start with `script-src 'self'` (Next.js needs nonces or `'unsafe-inline'`),
+  `connect-src 'self'` plus the RPC origin, and `frame-ancestors 'none'`; test the wallet fully
+  before enforcing, and roll out with `Content-Security-Policy-Report-Only` first.
+- **Deploy from a reviewed commit.** `ansible/README.md` rsyncs your local working copy as-is,
+  uncommitted changes included, and excludes `.git` — so the host keeps no record of what it is
+  running. Deploy from a tagged commit or a CI artifact, and record `git rev-parse HEAD` on the host.
 - **Persist and back up** the `./data` Postgres volumes.
 - **Dedicated Irys RPC**: the indexer makes heavy `eth_getLogs` calls; do not rely on the rate-limited
   public endpoints (`mainnet-beta-rpc*.irys.xyz`). Set the indexer start block to the Safe deployment block.
@@ -442,6 +558,283 @@ podman changes the networking and bind-mount behaviour described in §11, so pre
 service unless you have a specific reason not to.
 
 ---
+
+## 13. Local test chain (anvil fork of Irys)
+
+Test the wallet, the create-Safe flow and individual transaction payloads against a **disposable
+local copy of Irys**, with no risk to mainnet. Nothing here can reach the real chain: anvil never
+broadcasts, and stopping it discards all state.
+
+**Why a fork, not a fresh chain.** Safe's contracts live at deterministic CREATE2 addresses, and a
+bare anvil has none of them — you would have to redeploy all 13 and then override every address in
+the config service, the deployments patch and the UI. Forking Irys means the contracts are *already
+there, at exactly the addresses this stack is configured with*, and the fork keeps chain id 3282, so
+nothing else changes. Verified: `scripts/verify_deployments.py` passes byte-for-byte against a fork.
+
+### Quick path — chain only (best for checking payloads)
+
+```bash
+bash scripts/local_testnet.sh start          # resolves a concrete block and prints it
+bash scripts/local_testnet.sh verify         # all 13 contracts, byte-for-byte
+bash scripts/local_testnet.sh accounts       # funded test keys for MetaMask
+bash scripts/local_testnet.sh create-safe 2  # a real 2-of-3 Safe via the canonical factory
+bash scripts/local_testnet.sh stop           # discards everything
+```
+
+**Which block you fork.** `start` with no argument does not leave the block floating: it reads the
+tip, backs off `LOCAL_FORK_LAG` blocks (default 10) and passes that number explicitly, then prints
+it —
+
+```
+forking ... at block 2317502 (tip 2317512 minus LOCAL_FORK_LAG=10)
+  re-run 'scripts/local_testnet.sh start 2317502' to reproduce this exact state
+```
+
+so every run is concrete and repeatable, and you are never forking the newest block, which is the
+least reliable one (its state may not have settled upstream, and it can still be reorged away).
+`start <block>` pins explicitly; `start tip` restores the genuinely unpinned behaviour, which lands
+on a different block every run. The compose overlay does the same thing via `LOCAL_FORK_BLOCK`
+(unset = auto-resolve and log the block, `tip` = unpinned, a number = pin).
+
+Needs only docker or podman — `cast` runs in a container, no local foundry install. The chain
+listens on `127.0.0.1:8546`. This is the fastest way to answer "what does this transaction actually
+do": create a Safe, submit the payload, and inspect the resulting state directly with `cast`,
+independently of anything the UI claims.
+
+### Full path — the whole stack against the fork
+
+Use a **separate compose project and data directory** so you cannot touch production databases.
+In `.env`:
+
+```ini
+COMPOSE_PROJECT_NAME=irys-safe-local
+RPC_NODE_URL=http://anvil:8545              # what the services use (in the compose network)
+PUBLIC_RPC_NODE_URL=http://localhost:8546   # what the BROWSER uses (the published port)
+# LOCAL_FORK_BLOCK=2317034                  # pin a block; unset = auto (tip - LOCAL_FORK_LAG)
+```
+
+Those two RPC values must differ here, and that is the one non-obvious part: the transaction
+service resolves `anvil` inside the container network, while MetaMask and the wallet page run in
+your browser and can only reach the published port. `scripts/configure_irys.sh` writes
+`PUBLIC_RPC_NODE_URL` into the chain config the wallet reads, and leaves `RPC_NODE_URL` for the
+services. Then:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local-chain.yml up -d anvil
+bash scripts/run_locally_podman.sh
+```
+
+Wallet on <http://localhost:8000/>. Add the network to MetaMask (RPC `http://localhost:8546`, chain
+id 3282, symbol IRYS) and import a key from `local_testnet.sh accounts` — those accounts hold
+10000 test IRYS on the fork.
+
+Tear down with `docker compose -f docker-compose.yml -f docker-compose.local-chain.yml down -v`
+(`-v` also wipes the local Postgres volumes — safe here, never on production).
+
+### What this is good for
+
+- **The create-Safe flow** — the thing the deployments patch and `NEXT_PUBLIC_SAFE_VERSION` affect.
+  Rebuild the UI image, create a Safe, and confirm the proxy points at the 1.5.0 singleton.
+- **Signing and execution end to end**, with throwaway keys, against real contract bytecode.
+- **Independent payload verification.** Build the transaction in the UI, then check the decoded
+  calldata and the resulting state with `cast` against the fork. If those disagree, the UI is
+  lying — which is exactly the failure mode a self-hosted signing front-end has to rule out.
+
+### Caveats
+
+- Fork state is ephemeral and starts at the forked block; the indexer only sees activity from
+  there forward (`configure_irys.sh` aligns the start blocks automatically).
+- Pin the block (or note the one that was auto-resolved) when a test result matters — an
+  unpinned fork is a different chain state each run, which makes failures hard to reproduce.
+- **The fork must mine on an interval.** By default anvil mines only when a transaction
+  arrives, so the chain head freezes the moment a transaction is included, and anything waiting
+  for confirmations *after* inclusion never completes — the wallet's "Activating your account"
+  step hangs indefinitely while the Safe is, in fact, already deployed. Both the compose overlay
+  and `local_testnet.sh` now pass `--block-time` (`LOCAL_BLOCK_TIME`, default 2s). To fix a
+  already-running fork without losing state:
+  `curl -X POST $RPC -d '{"jsonrpc":"2.0","id":1,"method":"evm_setIntervalMining","params":[2]}'`
+- Historical calls hit the upstream RPC on demand, so keep it reachable; pin a block for
+  reproducibility.
+- These test keys are published in anvil's source. Never fund them, never reuse them anywhere.
+
+## 14. Upgrading the stack (and rehearsing it first)
+
+Five images are pinned: transaction service, config service, client gateway, events service, and
+the wallet UI base. Three of them own a Postgres database and run migrations on start, so an
+upgrade is **not** a pure image swap — it has to be shown to preserve data, not merely to boot.
+
+`scripts/upgrade_test.sh` rehearses the whole thing against a disposable fork of Irys (§13), in an
+isolated copy of the repo (`TEST_DIR`, default `.upgrade-test/`) so the test stack's `./data` can
+never collide with a real deployment's.
+
+### Find out where you are
+
+```bash
+scripts/upgrade_test.sh plan            # deployed vs. latest, side by side
+scripts/upgrade_test.sh probe           # deployed set, as a pinnable env fragment
+scripts/upgrade_test.sh latest          # newest published tags
+```
+
+`probe` reads a **live** deployment: versions come from `/cgw/about`, `/txs/api/v1/about/` and
+`/cfg/api/v1/about/`, and the UI version is extracted from the served bundle (it has no version
+endpoint — the app version is a constant next to the safe-wallet-web repo URL). The events service
+exposes no version endpoint at all; set `EVENTS_VERSION` by hand from the running image tag.
+
+Save the two ends as version sets — `versions/deployed.env` and `versions/latest.env` are checked in.
+
+### Rehearse the upgrade
+
+```bash
+scripts/upgrade_test.sh up       versions/deployed.env   # baseline: what production runs today
+scripts/upgrade_test.sh snapshot before.json
+scripts/upgrade_test.sh upgrade  versions/latest.env     # swap in place, migrations run
+scripts/upgrade_test.sh snapshot after.json
+scripts/upgrade_test.sh diff     before.json after.json
+scripts/upgrade_test.sh down                             # removes containers AND ./data
+```
+
+`snapshot` captures service versions, applied migration counts, row counts across the four
+databases, the served chain config, and the set of indexed Safe addresses. `diff` prints them
+side by side and **exits 1** if a migration count went backwards, any row count shrank, a Safe
+disappeared, or the chain config changed — so it is usable as a CI gate, not just a report.
+
+Start the baseline from the *deployed* set rather than from empty: an upgrade that works on a
+fresh database proves nothing about one that has to migrate months of accumulated state.
+
+### Then pin what you tested
+
+```bash
+scripts/upgrade_test.sh down
+bash scripts/pin_image_digests.sh          # digests of the set you just validated
+python3 scripts/verify_deployments.py      # contracts still verify
+```
+
+Paste the digests into `ansible/vars.yml` and deploy that exact set (§10). Upgrading the UI alone
+is not safe: it is built against a contemporary Client Gateway, so move all five together and
+validate them as one set.
+
+### Three steps that make a good upgrade look broken
+
+All three were found by running the rehearsal; `upgrade_test.sh upgrade` now does them for you.
+
+1. **Reload nginx.** It resolves upstream IPs once, at config load. Recreated containers get new
+   IPs, so nginx keeps dialling the old ones and returns **502** — `/cgw/about` and the UI, but
+   not `/txs` or `/cfg`, which are reached over shared unix sockets.
+   `docker compose exec nginx nginx -s reload`
+2. **Flush the transaction service's Redis.** It caches its own `/about` response, so after an
+   upgrade it keeps reporting the **previous** version. A version check that reads it without
+   flushing will tell you the upgrade did not happen when it did.
+   `docker compose exec txs-redis redis-cli FLUSHALL`
+3. **Use `up -d`, not `restart`.** `docker compose restart` reuses the existing container and
+   therefore the **old image**. Only `up -d` recreates it against the new tag. Mixing them leaves
+   a split stack — during this rehearsal the indexer ran the new code and applied migrations while
+   `txs-web` still served the old one.
+
+Verify against the **running image** (`docker compose ps` / `docker inspect`), not only the HTTP
+`about` endpoints, for exactly these reasons.
+
+### Verified compatibility: UI v1.99.1 with Client Gateway v1.115.0
+
+Because the gateway is capped at v1.115.0 on x86 (below), the newest UI has to run against a
+gateway about two months older. That pairing was rehearsed end to end against a fork and works:
+
+- The UI image built cleanly on the `safe-wallet-web:v1.99.1` base.
+- `docker/patch-irys-deployments.mjs` registered **13** v1.5.0 contracts, all `canonical`, **zero**
+  `eip155` — confirmed by counting `"3282":` entries in the served `_app-*.js` bundle.
+- `docker/patch-safe-versions.mjs` reported *"1.5.0 already in allowlist, nothing to do"*: upstream
+  ships `['1.5.0', '1.4.1', …]` from v1.99.1, so the patch is now a no-op guard (§8).
+- A Safe created through the canonical factory on the fork was indexed and served by CGW v1.115.0
+  as `version: 1.5.0+L2`, threshold 2, correct owners, `implementation` = the canonical v1.5.0
+  SafeL2 singleton — i.e. the `1.5.0+L2` string that needed the allowlist patch is accepted.
+- Wallet-critical gateway endpoints all returned 200: `/v1/chains/3282`, `/v1/chains`,
+  `.../balances/usd`, `.../transactions/queued`, `.../transactions/history`,
+  `/v1/chains/3282/about/master-copies`, and `/v2/chains?serviceKey=WALLET_WEB`.
+
+Two endpoints return non-200 and are **expected**, identically on the current production
+deployment:
+
+- `/cgw/v2/chains` → **422** `"serviceKey query parameter is required"`. It needs
+  `?serviceKey=WALLET_WEB`, which is why §7b registers that service in the Config Service.
+- `/cgw/v1/chains/3282/safes/<addr>/collectibles` → **404**; collectibles moved to `/v2/...`,
+  which returns 200. Newer UI builds call the v2 path.
+
+### Watch the image architecture
+
+`safeglobal/safe-client-gateway-nest` is published **arm64-only from v1.116.0**. On an x86 host the
+newest usable Client Gateway is **v1.115.0**, and `docker pull` of anything later fails with
+"no matching manifest for linux/amd64" — which, if the pull error is swallowed, silently leaves the
+old image running and the upgrade looking successful. `scripts/upgrade_test.sh latest` only offers
+tags built for the host architecture (override with `TARGET_ARCH`), so check your host first:
+
+```bash
+ssh <host> uname -m       # x86_64 -> CGW ceiling is v1.115.0
+```
+
+### Notes
+
+- `./data` is a **bind** mount, so `docker compose down -v` does not remove it, and its
+  directories are owned by the container's postgres uid — the host user cannot delete them.
+  `upgrade_test.sh down` wipes them from inside a throwaway container. A leftover `./data` is the
+  usual cause of "password authentication failed" on the next bring-up: the volume was
+  initialised with a different password.
+- The harness drives `docker compose`; production runs rootless podman. `configure_irys.sh`
+  detects the runtime and resolves container names through compose, so it works under both
+  (podman-compose names containers `project_service_1`, docker compose v2 `project-service-1`).
+
+## 15. Database backup and restore
+
+`scripts/db_backup.sh` dumps and restores the four Postgres databases. It is production-safe: no
+test overlays, works under docker or podman, and never touches the chain. Run it from the stack
+directory, or set `STACK_DIR`.
+
+```bash
+bash scripts/db_backup.sh backup  ./backups/pre-upgrade-$(date +%F)
+bash scripts/db_backup.sh verify  ./backups/pre-upgrade-2026-09-02
+bash scripts/db_backup.sh list    ./backups/pre-upgrade-2026-09-02
+bash scripts/db_backup.sh restore ./backups/pre-upgrade-2026-09-02   # asks first; FORCE=1 skips
+```
+
+**Why this is not optional before an upgrade.** Service upgrades run schema migrations on start,
+and migrations are **not reversible** — putting the old image tag back does not put the old schema
+back. A dump taken beforehand is the only route back. `upgrade_test.sh upgrade` takes one
+automatically and **aborts if it fails**, rather than proceeding with no rollback path.
+
+`verify` checks each dump is non-empty and ends with pg_dump's completion marker, so a truncated
+dump is caught before you need it rather than after.
+
+### Rolling back
+
+Restore alone is not a rollback. The dumps carry the **old schema**, so the images have to go back
+too or the new code will run against an old database. The manifest in each backup records the
+images that were actually running when it was taken, which is what you revert to:
+
+```bash
+grep running_ ./backups/pre-upgrade-2026-09-02/manifest.txt
+```
+
+Then, in order:
+
+1. Put those image tags back in `.env`.
+2. `bash scripts/db_backup.sh restore ./backups/...`
+3. `docker compose up -d` (**not** `restart` — see §14).
+4. Reload nginx and flush the txs Redis (§14).
+
+Verified end to end in the rehearsal: after rolling back from
+txs v6.10.1 / cfg v2.96.1 / cgw v1.115.0 to v6.4.0 / v2.95.0 / v1.112.0, the migration counts
+returned to their pre-upgrade values and the indexed Safe was still present.
+
+### Consistency
+
+For a strictly consistent set, stop the writers first:
+
+```bash
+docker compose stop txs-worker-indexer txs-scheduler txs-web cfg-web cgw-web events-web
+bash scripts/db_backup.sh backup ./backups/cold-$(date +%F)
+docker compose start txs-worker-indexer txs-scheduler txs-web cfg-web cgw-web events-web
+```
+
+A hot backup is fine for a rehearsal but can catch the indexer mid-write. Dumps contain your chain
+configuration and indexed history — treat them as sensitive and store them off the host.
 
 ## References
 
