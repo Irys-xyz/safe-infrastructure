@@ -34,7 +34,6 @@ backups/
 *.crt
 *.p12
 *.pfx
-!ansible/files/cloudflare-aop-ca.pem
 
 # Ad-hoc operator files. Anything scratch tends to accumulate credentials; keep it out by
 # default rather than relying on remembering.
