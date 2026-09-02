@@ -392,6 +392,14 @@
           become: true
           changed_when: true
 
+        - name: Ensure the Config Service media directory exists and is writable
+          ansible.builtin.file:
+            path: "{{ irys_dir }}/data/cfg-media"
+            state: directory
+            owner: "{{ stack_user }}"
+            group: "{{ stack_user }}"
+            mode: "0755"
+
         - name: Render the repo-root .env
           ansible.builtin.template:
             src: env.j2

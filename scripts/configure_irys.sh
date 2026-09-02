@@ -99,7 +99,17 @@ defaults = dict(
     block_explorer_uri_tx_hash_template="https://evm-explorer.irys.xyz/tx/{{txHash}}",
     block_explorer_uri_api_template="https://evm-explorer.irys.xyz/api?module={{module}}&action={{action}}&address={{address}}&apiKey={{apiKey}}",
     currency_name="Irys", currency_symbol="IRYS", currency_decimals=18,
-    currency_logo_uri="chains/%d/irys_currency.png" % CHAIN_ID,
+    # CoinGecko coin id for the native currency. Without it the Client Gateway logs
+    # "pricesProvider.nativeCoinId is not defined" on every balance request and the wallet
+    # shows no fiat value for IRYS at all.
+    #
+    # prices_provider_chain_name is deliberately left unset: it is the CoinGecko *asset
+    # platform* id, used to price ERC-20s by contract address, and CoinGecko has no platform
+    # for chain 3282. Setting it to anything would just produce failed lookups. ERC-20 tokens
+    # on Irys therefore have no fiat value until CoinGecko lists the chain.
+    prices_provider_native_coin=os.environ.get("PRICES_NATIVE_COIN") or "irys",
+    # Set below, only if the image really exists in MEDIA_ROOT -- pointing at a missing file
+    # makes the wallet render the native currency as a generic unknown token.
     # transaction_service_uri is public (served to browsers in the chain config); the vpc_ one is
     # the in-network address the Client Gateway calls. Keeping the internal http://nginx:8000 in
     # the public field leaks the container topology and breaks any client that reads it.
@@ -108,6 +118,25 @@ defaults = dict(
     recommended_master_copy_version="1.5.0", **ADDRS,
 )
 chain, _ = Chain.objects.update_or_create(id=CHAIN_ID, defaults=defaults)
+
+# Native-currency logo. MEDIA_ROOT is a volume (docker-compose.yml), so this survives a
+# recreate. Only claim the logo when the file is present: an ImageField pointing at a missing
+# file serves a 404, and the wallet then draws IRYS as an unnamed generic token.
+import os.path
+from django.conf import settings
+_logo_rel = "chains/%d/irys_currency.png" % CHAIN_ID
+_logo_abs = os.path.join(str(settings.MEDIA_ROOT), _logo_rel)
+if os.path.exists(_logo_abs):
+    if str(chain.currency_logo_uri) != _logo_rel:
+        chain.currency_logo_uri = _logo_rel
+        chain.save(update_fields=["currency_logo_uri"])
+    print("    currency logo present (%s)" % _logo_rel)
+else:
+    if str(chain.currency_logo_uri or ""):
+        chain.currency_logo_uri = ""
+        chain.save(update_fields=["currency_logo_uri"])
+    print("    WARN: %s missing under MEDIA_ROOT -- native currency will have no icon." % _logo_rel)
+    print("          Install it with: scripts/install_currency_logo.sh")
 
 # Gas price. Without at least one GasPrice row the chains API serves "gasPrice": [], and the
 # wallet has no fee data to build or price a transaction with -- which shows up as the UI
@@ -126,9 +155,14 @@ GasPrice.objects.update_or_create(
 print("    gas price configured (fixed EIP-1559)")
 svc, _ = Service.objects.get_or_create(
     key="WALLET_WEB", defaults={"name": "Safe Wallet Web", "description": "Safe{Wallet} web client"})
-# REQUIRE_LOGIN_DISABLED turns off the forced Spaces sign-in (RUNBOOK §7c).
+# Chain features the wallet checks with useHasFeature(). A missing key does not degrade
+# gracefully -- the UI hides the whole surface. NESTED_SAFES in particular gates the
+# owned-Safes query outright (`skip: !enabled`), so without it the wallet never discovers
+# which Safes a Safe owns and the nested-Safe UI is simply absent.
+# REQUIRE_LOGIN_DISABLED turns off the forced Spaces sign-in (RUNBOOK section 7c).
 FEATURES = ["MY_ACCOUNTS", "SPENDING_LIMIT", "SAFE_APPS", "ERC1155", "ERC721",
-            "DOMAIN_LOOKUP", "CONTRACT_INTERACTION", "REQUIRE_LOGIN_DISABLED"]
+            "DOMAIN_LOOKUP", "CONTRACT_INTERACTION", "REQUIRE_LOGIN_DISABLED",
+            "NESTED_SAFES"]
 for key in FEATURES:
     f, _ = Feature.objects.get_or_create(key=key)
     f.chains.add(chain)     # add from the Feature side; the Chain-side M2M trips a buggy signal

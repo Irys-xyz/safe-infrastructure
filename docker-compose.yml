@@ -38,6 +38,9 @@ services:
       - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - nginx-shared-txs:/nginx-txs
       - nginx-shared-cfg:/nginx-cfg
+      # The Config Service's MEDIA_ROOT, read-only. Django does not serve MEDIA_URL with
+      # DEBUG off, so nginx serves it directly (see the /cfg/media/ location).
+      - ./data/cfg-media:/nginx-cfg-media:ro
     depends_on:
       - txs-web
       - cfg-web
@@ -191,6 +194,10 @@ services:
     tty: true
     volumes:
       - nginx-shared-cfg:/nginx
+      # MEDIA_ROOT. Chain and currency images uploaded through the Django admin live here;
+      # without a volume they sit in the container's writable layer and are destroyed by the
+      # next `docker compose down`, which is why the native-currency logo 404s.
+      - ./data/cfg-media:/app/src/media
     env_file:
       - container_env_files/cfg.env
     environment:
