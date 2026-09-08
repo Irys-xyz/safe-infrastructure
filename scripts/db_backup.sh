@@ -20,42 +20,36 @@
 #   bash scripts/db_backup.sh restore ./backups/pre-upgrade-2026-09-02
 #
 # Notes
-#   - Stop the writers first for a strictly consistent set: `docker compose stop txs-worker-indexer
-#     txs-scheduler txs-web cfg-web cgw-web events-web`, back up, then start them again. A hot
-#     backup is fine for a rehearsal but can catch the indexer mid-write.
+#   - Stop the writers first, for BOTH directions:
+#     `docker compose stop txs-worker-indexer txs-scheduler txs-web cfg-web cgw-web events-web`.
+#     For a backup a hot dump is fine for a rehearsal but can catch the indexer mid-write. For a
+#     restore it is close to mandatory: the dump drops and recreates every object, which needs
+#     locks a live writer holds, so a hot restore either blocks or races the application.
 #   - Dumps contain your chain configuration and indexed history. Treat them as sensitive and
-#     store them off the host.
+#     store them off the host. The directory is created 0700 and the dumps 0600.
 
 set -o pipefail
+
+# shellcheck source=lib/stack.sh
+. "$(dirname "$0")/lib/stack.sh"
 
 STACK_DIR="${STACK_DIR:-$PWD}"
 [ -f "$STACK_DIR/docker-compose.yml" ] || {
   echo "error: no docker-compose.yml in $STACK_DIR (set STACK_DIR)" >&2; exit 1; }
 
-RUNTIME="${CONTAINER_RUNTIME:-$(command -v podman || command -v docker)}"
-RUNTIME="$(basename "$RUNTIME")"
+RUNTIME=$(resolve_runtime)
 COMPOSE_CMD="${COMPOSE_CMD:-docker compose}"
 
-# db service -> the label used in filenames
 DBS="txs-db cfg-db cgw-db events-db"
 
 cd "$STACK_DIR"
 
-# Resolve a compose service to a container, tolerating both naming schemes.
-cname() {
-  local svc=$1 id
-  id=$($COMPOSE_CMD ps -q "$svc" 2>/dev/null | head -1)
-  [ -n "$id" ] && { echo "$id"; return 0; }
-  local proj="${COMPOSE_PROJECT_NAME:-$(basename "$PWD")}"
-  for n in "${proj}_${svc}_1" "${proj}-${svc}-1"; do
-    $RUNTIME inspect "$n" >/dev/null 2>&1 && { echo "$n"; return 0; }
-  done
-  return 1
-}
-
 cmd_backup() {
   local dir=${1:?usage: backup <dir>}
-  mkdir -p "$dir"
+  # The dumps are credentials-adjacent: keep them off other accounts on the host rather than
+  # leaving them at whatever the ambient umask happens to be.
+  mkdir -p "$dir" && chmod 700 "$dir"
+  umask 077
   echo "==> backing up to $dir"
   local ok=0 fail=0
   for db in $DBS; do
@@ -139,11 +133,31 @@ cmd_restore() {
   for db in $DBS; do
     local c; c=$(cname "$db") || { echo "  SKIP $db (no container)"; fail=$((fail+1)); continue; }
     printf '  %-12s ' "$db"
-    if $RUNTIME exec -i "$c" psql -U postgres -d postgres -q -v ON_ERROR_STOP=0 \
-         < "$dir/$db.sql" >/dev/null 2>"$dir/$db.restore.err"; then
+    # Drop any connection still open on the database. The dump's DROPs need locks that an
+    # application container holds for as long as it is connected, and `restart: unless-stopped`
+    # means one killed mid-restore comes straight back -- hence the "stop the writers" note in
+    # the header. This only clears what is left over.
+    $RUNTIME exec -i "$c" psql -U postgres -d postgres -q -c \
+      "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+        WHERE datname = current_database() AND pid <> pg_backend_pid()" >/dev/null 2>&1
+    # --single-transaction + ON_ERROR_STOP=1 is what makes this a rollback path rather than a
+    # coin flip: any error aborts the whole restore and leaves the database exactly as it was,
+    # and psql's exit status then means something. With ON_ERROR_STOP=0 psql ran past every
+    # failure and still exited 0, so a half-applied restore -- the worst possible outcome, on
+    # the worst possible day -- reported "ok".
+    #
+    # lock_timeout turns the other failure mode, a writer still holding a lock the dump's DROPs
+    # need, into a clean rolled-back failure that names the problem, instead of a hang.
+    if $RUNTIME exec -i -e PGOPTIONS='-c lock_timeout=30s' "$c" \
+         psql -U postgres -d postgres -q --single-transaction \
+         -v ON_ERROR_STOP=1 < "$dir/$db.sql" >/dev/null 2>"$dir/$db.restore.err"; then
       echo "ok"
+      # Keep the file only if psql actually said something (notices on a clean run).
+      [ -s "$dir/$db.restore.err" ] || rm -f "$dir/$db.restore.err"
     else
-      echo "FAILED (see $dir/$db.restore.err)"; fail=$((fail+1))
+      echo "FAILED -- rolled back, database unchanged (see $dir/$db.restore.err)"
+      sed -n '1,3p' "$dir/$db.restore.err" 2>/dev/null | sed 's/^/      /'
+      fail=$((fail+1))
     fi
   done
   echo "==> restart the services so they reconnect: $COMPOSE_CMD restart"
@@ -155,5 +169,5 @@ case "${1:-}" in
   restore) shift; cmd_restore "$@" ;;
   verify)  shift; cmd_verify "$@" ;;
   list)    shift; cmd_list "$@" ;;
-  *) sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) usage "$0"; exit 1 ;;
 esac

@@ -21,7 +21,10 @@
 
 set -o pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || { echo "error: cannot cd to the repo root" >&2; exit 1; }
+
+# shellcheck source=lib/stack.sh
+. "$(dirname "$0")/lib/stack.sh"
 
 # Load .env so COMPOSE_PROJECT_NAME, REVERSE_PROXY_PORT and the optional
 # *_SUPERUSER_* variables are visible to this script (compose reads it too).
@@ -47,26 +50,38 @@ ensure_images() {
   # Rebuild when the image is missing OR when its baked gateway differs from the requested one, so a
   # change actually takes effect.
   UI_REBUILT=0
-  local ui_img=localhost/safe-wallet-web-irys:3282
+  # Tagged by chain id, because the chain id is baked into the bundle: a fork on another id
+  # needs its own image, and must not silently reuse the one built for 3282.
+  local ui_chain; ui_chain=$(chain_id)
+  local ui_img="localhost/safe-wallet-web-irys:${ui_chain}"
   local ui_gw="${UI_GATEWAY_URL:-/cgw}"
   local ui_base="${UI_BASE_IMAGE:-docker.io/safeglobal/safe-wallet-web:latest}"
-  local ui_baked ui_baked_base
+  local ui_baked ui_baked_base ui_baked_chain
   ui_baked=$(podman image inspect "$ui_img" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
                | sed -n 's/^NEXT_PUBLIC_GATEWAY_URL_PRODUCTION=//p')
-  # Rebuild on a base-image change too, not just a gateway change: repinning UI_BASE_IMAGE to a
-  # new digest must actually rebuild, or the stack keeps serving the previously baked bundle.
+  # Rebuild on a base-image or chain-id change too, not just a gateway change: repinning
+  # UI_BASE_IMAGE to a new digest must actually rebuild, or the stack keeps serving the
+  # previously baked bundle, and a fork under a different chain id needs its own build.
   ui_baked_base=$(podman image inspect "$ui_img" --format '{{index .Labels "irys.base-image"}}' 2>/dev/null)
-  if [ "$ui_baked" != "$ui_gw" ] || [ "$ui_baked_base" != "$ui_base" ]; then
-    echo "    building  $ui_img (gateway $ui_gw, base $ui_base)"
-    if podman build -t "$ui_img" --build-arg "NEXT_PUBLIC_GATEWAY_URL_PRODUCTION=$ui_gw" \
+  ui_baked_chain=$(podman image inspect "$ui_img" --format '{{index .Labels "irys.chain-id"}}' 2>/dev/null)
+  if [ "$ui_baked" != "$ui_gw" ] || [ "$ui_baked_base" != "$ui_base" ] \
+     || [ "$ui_baked_chain" != "$ui_chain" ]; then
+    echo "    building  $ui_img (gateway $ui_gw, chain $ui_chain, base $ui_base)"
+    # A failed build must stop the deploy. Falling through left the previously built image
+    # running while systemd/Ansible reported success -- so a repinned UI_BASE_IMAGE would
+    # silently keep serving the old signing bundle, defeating the pin.
+    if ! podman build -t "$ui_img" --build-arg "NEXT_PUBLIC_GATEWAY_URL_PRODUCTION=$ui_gw" \
          --build-arg "UI_BASE_IMAGE=$ui_base" \
+         --build-arg "IRYS_CHAIN_ID=$ui_chain" \
          -f docker/ui-irys.Dockerfile .; then
-      UI_REBUILT=1
-    else
-      echo "    WARN: failed to build the custom UI image"
+      echo "error: failed to build $ui_img -- refusing to start the stack on a stale UI." >&2
+      echo "       The bundle renders what owners are asked to sign; serving the previous" >&2
+      echo "       build silently would defeat the point of pinning UI_BASE_IMAGE." >&2
+      exit 1
     fi
+    UI_REBUILT=1
   else
-    echo "    present  $ui_img (gateway $ui_gw, base $ui_base)"
+    echo "    present  $ui_img (gateway $ui_gw, chain $ui_chain, base $ui_base)"
   fi
   $COMPOSE config 2>/dev/null | awk '$1=="image:"{print $2}' | sort -u | while read -r img; do
     [ -n "$img" ] || continue

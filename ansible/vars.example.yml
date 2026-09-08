@@ -7,9 +7,13 @@ stack_user: irys                 # unprivileged user that owns + runs the stack 
                                  # lands writable by the stack.
 
 # --- how the code reaches the host ---
-# git (default) checks out a pinned revision and records it in DEPLOYED_REVISION. Pin a tag
-# or SHA for production rather than a branch, so a deploy is reproducible.
-irys_repo_version: main
+# git (default) checks out a pinned revision and records it in DEPLOYED_REVISION.
+#
+# Set this to a tag or a full commit SHA, not a branch. A branch name is resolved at deploy
+# time, so two runs of the same playbook can land different code and DEPLOYED_REVISION is the
+# only record of which -- which defeats the point of deploying from a revision at all.
+# Get the current one with: git rev-parse HEAD
+irys_repo_version: REPLACE_WITH_A_TAG_OR_SHA
 # irys_repo_url: https://github.com/Irys-xyz/safe-infrastructure.git
 # Set to rsync to push your local working copy instead — uncommitted changes included.
 # Fine for a test host, not for production.

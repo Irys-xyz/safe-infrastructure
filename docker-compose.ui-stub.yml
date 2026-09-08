@@ -10,6 +10,10 @@
 #                  -f docker-compose.ui-stub.yml up -d
 #
 # Drop this overlay when you need to test the wallet itself.
+#
+# Requires Docker Compose v2.24 or later: `!reset` is a Compose-spec tag that podman-compose
+# does not implement, so this overlay must be used with `docker compose` (which is what
+# scripts/upgrade_test.sh invokes) and not podman-compose.
 services:
   ui:
     image: docker.io/library/busybox:1.36

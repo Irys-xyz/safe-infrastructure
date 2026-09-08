@@ -44,3 +44,7 @@ scratch/
 *.local
 *.bak
 *.orig
+
+# Python bytecode, from importing scripts/verify_deployments.py for its self-test.
+__pycache__/
+*.pyc

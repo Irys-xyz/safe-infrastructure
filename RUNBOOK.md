@@ -658,9 +658,15 @@ Tear down with `docker compose -f docker-compose.yml -f docker-compose.local-cha
   arrives, so the chain head freezes the moment a transaction is included, and anything waiting
   for confirmations *after* inclusion never completes — the wallet's "Activating your account"
   step hangs indefinitely while the Safe is, in fact, already deployed. Both the compose overlay
-  and `local_testnet.sh` now pass `--block-time` (`LOCAL_BLOCK_TIME`, default 2s). To fix a
-  already-running fork without losing state:
-  `curl -X POST $RPC -d '{"jsonrpc":"2.0","id":1,"method":"evm_setIntervalMining","params":[2]}'`
+  and `local_testnet.sh` run the same entrypoint (`scripts/anvil-fork.sh`), which passes
+  `--block-time` (`LOCAL_BLOCK_TIME`, default 9s — measured Irys Mainnet is ~8.8 s/block). To
+  fix an already-running fork without losing state:
+  `curl -X POST $RPC -d '{"jsonrpc":"2.0","id":1,"method":"evm_setIntervalMining","params":[9]}'`
+- The Client Gateway builds its own RPC client from the chain config's `rpcUri`, which has to
+  hold the *browser-reachable* URL (the config service has no internal-only RPC field the way
+  it has `vpc_transaction_service_uri` for the transaction service). Against a local fork those
+  two differ, so CGW's RPC-backed endpoints — relay, counterfactual checks — do not work here.
+  The wallet itself does. Nothing changes in production, where both URLs are the same.
 - Historical calls hit the upstream RPC on demand, so keep it reachable; pin a block for
   reproducibility.
 - These test keys are published in anvil's source. Never fund them, never reuse them anywhere.
@@ -688,7 +694,10 @@ scripts/upgrade_test.sh latest          # newest published tags
 endpoint — the app version is a constant next to the safe-wallet-web repo URL). The events service
 exposes no version endpoint at all; set `EVENTS_VERSION` by hand from the running image tag.
 
-Save the two ends as version sets — `versions/deployed.env` and `versions/latest.env` are checked in.
+Save the two ends as version sets. `versions/latest.env` is checked in (newest published upstream
+tags — not what any host runs); `versions/deployed.env` is **gitignored**, because naming the exact
+versions a live deployment runs is an inventory an attacker can match against advisories. Generate
+it on the host from `versions/deployed.env.example`.
 
 ### Rehearse the upgrade
 
@@ -843,6 +852,34 @@ docker compose start txs-worker-indexer txs-scheduler txs-web cfg-web cgw-web ev
 
 A hot backup is fine for a rehearsal but can catch the indexer mid-write. Dumps contain your chain
 configuration and indexed history — treat them as sensitive and store them off the host.
+
+For a restore, stopping the writers is close to mandatory rather than merely advisable: the dump
+drops and recreates every object, which needs locks a live writer holds. A restore now runs in one
+transaction, so a failure leaves the database exactly as it was, and it times out on a held lock
+rather than hanging.
+
+## 16. Tests
+
+`tests/run.sh` covers the operational scripts. No dependencies beyond bash, python3 and — for
+three of the tests — docker; anything missing is reported as a skip rather than a pass.
+
+```bash
+tests/run.sh                # everything (~20s)
+tests/run.sh restore digest # only tests matching these substrings
+tests/run.sh --prove        # also run against BASE_REF (default HEAD) and require that every
+                            # regression test FAILS there, with a real assertion failure
+```
+
+It deliberately does not chase coverage. These scripts are mostly orchestration, and a test
+asserting that `compose up` was called says nothing. What is covered is the behaviour that is
+*surprising* — `psql` exiting 0 after every SQL error, `compose ps` having no row for a service
+it failed to create, gitignoring not excluding a file from `tar`, `${ref##*:}` yielding a digest
+rather than a tag — because that is where a future edit reintroduces the bug. `tests/README.md`
+lists each case and the surprise it pins.
+
+Run `--prove` before committing a fix: the working tree has it and `HEAD` does not, so it shows
+you the test failing on the real bug. A regression test that has never been seen to fail is not
+evidence of anything.
 
 ## References
 

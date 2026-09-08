@@ -185,8 +185,8 @@ def get_code_many(url, addresses, chunk=20):
 
 
 def check(url):
-    """Run all checks against one endpoint. Returns (failures, warnings)."""
-    fails, warns = [], []
+    """Run all checks against one endpoint. Returns the list of failures."""
+    fails = []
     print(f"\n== {url}")
 
     try:
@@ -194,11 +194,11 @@ def check(url):
     except Exception as e:
         fails.append(f"{url}: unreachable ({e})")
         print(f"  UNREACHABLE  {e}")
-        return fails, warns
+        return fails
     if cid != CHAIN_ID:
         fails.append(f"{url}: chainId {cid}, expected {CHAIN_ID}")
         print(f"  FAIL  chainId {cid} != {CHAIN_ID}")
-        return fails, warns
+        return fails
     print(f"  ok    chainId {cid}")
 
     wanted = [a for a, _ in MUST_BE_PRESENT.values()] + list(MUST_BE_ABSENT.values())
@@ -224,19 +224,25 @@ def check(url):
 
     for name, addr in MUST_BE_ABSENT.items():
         code = codes.get(addr)
+        # A must-be-absent address whose state we could not read is not a pass. An endpoint
+        # that refuses these queries would otherwise satisfy the check by saying nothing.
         if isinstance(code, Exception):
-            warns.append(f"{url}: {name}: RPC error {code}")
+            fails.append(f"{url}: {name}: RPC error on a must-be-absent address: {code}")
+            print(f"  ERROR {name:32} {code}")
             continue
         if code not in ("0x", "", None):
-            warns.append(
+            # A blocker, per the contract at the top of this file: a proxy factory reachable
+            # without its matching singleton means the create-Safe flow can deploy a proxy
+            # pointing at codeless code -- a bricked Safe, with anything sent to it lost.
+            fails.append(
                 f"{url}: {name} ({addr}) now HAS code — an older Safe version has been "
                 f"deployed to Irys. Re-run the full audit before widening "
                 f"docker/patch-irys-deployments.mjs, and confirm no proxy factory is "
                 f"reachable without its matching singleton.")
-            print(f"  WARN  {name:32} unexpectedly has code at {addr}")
+            print(f"  FAIL  {name:32} unexpectedly has code at {addr}")
         else:
             print(f"  ok    {name:32} absent (as expected)")
-    return fails, warns
+    return fails
 
 
 def main():
@@ -257,22 +263,19 @@ def main():
           f"{len(MUST_BE_ABSENT)} must-be-absent addresses on chain {CHAIN_ID} "
           f"across {len(rpcs)} endpoint(s)")
 
-    all_fails, all_warns = [], []
+    all_fails = []
     for url in rpcs:
-        f, w = check(url)
-        all_fails += f
-        all_warns += w
+        all_fails += check(url)
 
     print("\n" + "=" * 78)
-    for w in all_warns:
-        print(f"WARN: {w}")
     if all_fails:
         for f in all_fails:
             print(f"FAIL: {f}")
         print(f"\n{len(all_fails)} FAILURE(S) — do not deploy against these contracts.")
         return 1
-    print(f"PASS: all {len(MUST_BE_PRESENT)} v1.5.0 contracts verified byte-for-byte on "
-          f"{len(rpcs)} endpoint(s)" + (f"; {len(all_warns)} warning(s)" if all_warns else ""))
+    print(f"PASS: all {len(MUST_BE_PRESENT)} v1.5.0 contracts verified byte-for-byte, and all "
+          f"{len(MUST_BE_ABSENT)} must-be-absent addresses confirmed codeless, on "
+          f"{len(rpcs)} endpoint(s)")
     return 0
 
 

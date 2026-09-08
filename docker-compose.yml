@@ -23,6 +23,38 @@ x-healthcheck-celery-template: &celeryhealthcheck
     timeout: 30s
     retries: 3
 
+# Infrastructure credentials, single-sourced from the repo-root .env.
+#
+# Required, not defaulted: falling back to the published upstream defaults (postgres / guest)
+# brought the whole stack up on credentials anyone can look up, with nothing printed. The
+# Ansible path gates these properly (ansible/irys-safe.yml), but a hand-run `docker compose up`
+# or scripts/run_locally_podman.sh bypassed that gate entirely. Fail closed instead.
+#
+# Postgres applies POSTGRES_PASSWORD at initdb ONLY. On an existing ./data volume the stored
+# password does not change -- rotating it needs an ALTER USER inside each database as well
+# (RUNBOOK section 10).
+x-postgres-password: &pgpassword
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see RUNBOOK section 3)}
+
+# The transaction service's connection strings. Defined once and merged into every txs-*
+# service: four hand-maintained copies of a credential-bearing URL is four chances to drift.
+# These override the values in container_env_files/txs.env, so the app and the servers the
+# app connects to can never disagree.
+#
+# NOTE: the credentials are interpolated into URLs, so a password containing @ / : or # would
+# produce a malformed URL. Generate them with `openssl rand -hex 32` (RUNBOOK section 3), which
+# is URL-safe by construction.
+x-txs-connections: &txsconnections
+  DATABASE_URL: psql://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@txs-db:5432/postgres
+  CELERY_BROKER_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}@txs-rabbitmq/
+  EVENTS_QUEUE_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}@general-rabbitmq:5672
+
+# RabbitMQ broker credentials. Without these the broker only accepts guest/guest, so any
+# credentials configured on the client side are refused with ACCESS_REFUSED(403).
+x-rabbitmq-credentials: &rabbitcredentials
+  RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+  RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env (see RUNBOOK section 3)}
+
 services:
   # Common nginx and database
   nginx:
@@ -53,11 +85,7 @@ services:
     restart: unless-stopped
     command: -c 'max_connections=250'
     environment:
-      # Must match what the service connecting to this database is configured with
-      # (POSTGRES_PASSWORD in cfg.env, or the password inside DATABASE_URL for txs/events).
-      # NOTE: Postgres only applies this at initdb. On an existing ./data volume the stored
-      # password does not change -- rotate with ALTER USER inside the DB as well (RUNBOOK s10).
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      <<: *pgpassword
     volumes:
       - ./data/txs-db:/var/lib/postgresql/data
     <<: *pghealthcheck
@@ -66,11 +94,7 @@ services:
     image: postgres:14-alpine${POSTGRES_DIGEST:-}
     restart: unless-stopped
     environment:
-      # Must match what the service connecting to this database is configured with
-      # (POSTGRES_PASSWORD in cfg.env, or the password inside DATABASE_URL for txs/events).
-      # NOTE: Postgres only applies this at initdb. On an existing ./data volume the stored
-      # password does not change -- rotate with ALTER USER inside the DB as well (RUNBOOK s10).
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      <<: *pgpassword
     volumes:
       - ./data/cfg-db:/var/lib/postgresql/data
     <<: *pghealthcheck
@@ -79,11 +103,7 @@ services:
     image: postgres:14-alpine${POSTGRES_DIGEST:-}
     restart: unless-stopped
     environment:
-      # Must match what the service connecting to this database is configured with
-      # (POSTGRES_PASSWORD in cfg.env, or the password inside DATABASE_URL for txs/events).
-      # NOTE: Postgres only applies this at initdb. On an existing ./data volume the stored
-      # password does not change -- rotate with ALTER USER inside the DB as well (RUNBOOK s10).
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      <<: *pgpassword
     volumes:
       - ./data/events-db:/var/lib/postgresql/data
     <<: *pghealthcheck
@@ -92,11 +112,7 @@ services:
     image: postgres:14-alpine${POSTGRES_DIGEST:-}
     restart: unless-stopped
     environment:
-      # Must match what the service connecting to this database is configured with
-      # (POSTGRES_PASSWORD in cfg.env, or the password inside DATABASE_URL for txs/events).
-      # NOTE: Postgres only applies this at initdb. On an existing ./data volume the stored
-      # password does not change -- rotate with ALTER USER inside the DB as well (RUNBOOK s10).
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      <<: *pgpassword
     volumes:
       - ./data/cgw-db:/var/lib/postgresql/data
     <<: *pghealthcheck
@@ -111,10 +127,7 @@ services:
     image: rabbitmq:3.13-alpine${RABBITMQ_DIGEST:-}
     restart: unless-stopped
     environment:
-      # Without these the broker only accepts guest/guest, so any credentials configured on
-      # the client side are refused with ACCESS_REFUSED(403). Set once in the repo-root .env.
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+      <<: *rabbitcredentials
 
   txs-worker-indexer: &txs-worker
     image: safeglobal/safe-transaction-service:${TXS_VERSION}${TXS_DIGEST:-}
@@ -122,14 +135,10 @@ services:
     env_file:
       - container_env_files/txs.env
     environment:
-      - ETHEREUM_NODE_URL=${RPC_NODE_URL}
-      - RUN_MIGRATIONS=1
-      - WORKER_QUEUES=default,indexing,processing
-      # Single source of truth for credentials (repo-root .env). These override the values in
-      # container_env_files/txs.env, so the app and the servers can never drift apart.
-      - DATABASE_URL=psql://postgres:${POSTGRES_PASSWORD:-postgres}@txs-db:5432/postgres
-      - CELERY_BROKER_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@txs-rabbitmq/
-      - EVENTS_QUEUE_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@general-rabbitmq:5672
+      <<: *txsconnections
+      ETHEREUM_NODE_URL: ${RPC_NODE_URL:?set RPC_NODE_URL in .env}
+      RUN_MIGRATIONS: 1
+      WORKER_QUEUES: default,indexing,processing
     depends_on:
       txs-db:
         condition: service_healthy
@@ -141,11 +150,9 @@ services:
   txs-worker-contracts-tokens:
     <<: *txs-worker
     environment:
-      - WORKER_QUEUES=contracts,tokens
-      - ETHEREUM_NODE_URL=${RPC_NODE_URL}
-      - DATABASE_URL=psql://postgres:${POSTGRES_PASSWORD:-postgres}@txs-db:5432/postgres
-      - CELERY_BROKER_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@txs-rabbitmq/
-      - EVENTS_QUEUE_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@general-rabbitmq:5672
+      <<: *txsconnections
+      WORKER_QUEUES: contracts,tokens
+      ETHEREUM_NODE_URL: ${RPC_NODE_URL:?set RPC_NODE_URL in .env}
     depends_on:
       txs-worker-indexer:
         condition: service_healthy
@@ -153,11 +160,9 @@ services:
   txs-worker-notifications-webhooks:
     <<: *txs-worker
     environment:
-      - WORKER_QUEUES=notifications,webhooks
-      - ETHEREUM_NODE_URL=${RPC_NODE_URL}
-      - DATABASE_URL=psql://postgres:${POSTGRES_PASSWORD:-postgres}@txs-db:5432/postgres
-      - CELERY_BROKER_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@txs-rabbitmq/
-      - EVENTS_QUEUE_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@general-rabbitmq:5672
+      <<: *txsconnections
+      WORKER_QUEUES: notifications,webhooks
+      ETHEREUM_NODE_URL: ${RPC_NODE_URL:?set RPC_NODE_URL in .env}
     depends_on:
       txs-worker-indexer:
         condition: service_healthy
@@ -168,10 +173,8 @@ services:
     env_file:
       - container_env_files/txs.env
     environment:
-      - ETHEREUM_NODE_URL=${RPC_NODE_URL}
-      - DATABASE_URL=psql://postgres:${POSTGRES_PASSWORD:-postgres}@txs-db:5432/postgres
-      - CELERY_BROKER_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@txs-rabbitmq/
-      - EVENTS_QUEUE_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@general-rabbitmq:5672
+      <<: *txsconnections
+      ETHEREUM_NODE_URL: ${RPC_NODE_URL:?set RPC_NODE_URL in .env}
     depends_on:
       txs-worker-indexer:
         condition: service_healthy
@@ -201,7 +204,7 @@ services:
     env_file:
       - container_env_files/cfg.env
     environment:
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      <<: *pgpassword
     depends_on:
       cfg-db:
         condition: service_healthy
@@ -220,8 +223,8 @@ services:
     env_file:
       - container_env_files/cgw.env
     environment:
+      <<: *pgpassword
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     depends_on:
       cgw-redis:
         condition: service_healthy
@@ -231,7 +234,7 @@ services:
     # (pending safe-deployments PR #1555), so the stock image cannot create Safes on Irys. This
     # custom image patches 3282 into the deployment data. Build it before bringing the stack up:
     #   podman build -t localhost/safe-wallet-web-irys:3282 -f docker/ui-irys.Dockerfile .
-    image: localhost/safe-wallet-web-irys:3282
+    image: localhost/safe-wallet-web-irys:${IRYS_CHAIN_ID:-3282}
     restart: unless-stopped
     build:
       context: .
@@ -255,8 +258,7 @@ services:
     image: rabbitmq:3.13-alpine${RABBITMQ_DIGEST:-}
     restart: unless-stopped
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+      <<: *rabbitcredentials
     healthcheck:
       test: rabbitmq-diagnostics -q ping
       interval: 15s
@@ -270,8 +272,8 @@ services:
     env_file:
       - container_env_files/events.env
     environment:
-      DATABASE_URL: psql://postgres:${POSTGRES_PASSWORD:-postgres}@events-db:5432/postgres
-      AMQP_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@general-rabbitmq:5672
+      DATABASE_URL: psql://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@events-db:5432/postgres
+      AMQP_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}@general-rabbitmq:5672
     depends_on:
       events-db:
         condition: service_healthy

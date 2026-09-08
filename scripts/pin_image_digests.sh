@@ -16,7 +16,16 @@
 # Paste the output into vars.yml, then redeploy. Re-run after any deliberate image upgrade.
 
 set -o pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || { echo "error: cannot cd to the repo root" >&2; exit 1; }
+
+# Load .env: UI_BASE_IMAGE lives there (Ansible renders it from irys_ui_base_image), and
+# without it this script fell back to :latest and could report the digest of a *different*
+# wallet build from the one the stack is actually running -- the one pin that most needs to
+# be right, since that image renders what owners are asked to sign.
+set -a
+# shellcheck disable=SC1091
+[ -f .env ] && . ./.env
+set +a
 
 MODE="${1:-vars}"
 RUNTIME=$(command -v podman || command -v docker) || {
@@ -34,10 +43,12 @@ redis|redis|REDIS
 rabbitmq|rabbitmq|RABBITMQ
 nginx|nginx|NGINX'
 
-# All local images as "repository:tag <digest>", digest empty when the image was not pulled
-# from a registry (e.g. the locally built UI image, which is pinned via its base instead).
+# Local images as "repository:tag", newest first. Both runtimes list newest-first by default,
+# so dedupe without sorting -- `sort -u` here made the "newest" selection below lexicographic
+# instead, which picks postgres:14-alpine over postgres:17-bookworm.
 local_images() {
-  "$RUNTIME" images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>' | sort -u
+  "$RUNTIME" images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+    | grep -v '<none>' | awk '!seen[$0]++'
 }
 
 # Registry digest an image was pulled by.
@@ -48,13 +59,29 @@ digest_of() {
 }
 
 # Prefer the image a running container of this stack uses; otherwise the newest local image
-# for the repository. Strips any registry prefix so docker.io/foo and foo both match.
+# for the repository.
+#
+# Match on the repository component with the registry prefix ignored, but print the reference
+# exactly as the runtime reported it, since that is what `image inspect` is given.
+#
+# The prefix to ignore includes the implicit `library/` namespace podman spells out: it reports
+# official images as `docker.io/library/postgres:14-alpine`, and matching that against
+# `^postgres:` fails. Stripping only `docker.io/` left `library/` behind, so postgres, redis,
+# rabbitmq and nginx matched nothing on the production runtime and four of the eight digests
+# this script exists to emit were silently skipped.
+match_repo() {
+  awk -v repo="$1" -v anchored="$2" '
+    { s = $0
+      sub(/^docker\.io\//, "", s)
+      sub(/^library\//, "", s)
+      if (s ~ "^" repo (anchored ? ":" : "([:@]|$)")) print $0 }'
+}
+
 resolve_ref() {
   local repo=$1 ref
-  ref=$("$RUNTIME" ps --format '{{.Image}}' 2>/dev/null \
-          | sed 's#^docker\.io/##' | grep -E "^${repo}(:|@|$)" | head -1)
+  ref=$("$RUNTIME" ps --format '{{.Image}}' 2>/dev/null | match_repo "$repo" "" | head -1)
   [ -n "$ref" ] && { echo "$ref"; return; }
-  local_images | sed 's#^docker\.io/##' | grep -E "^${repo}:" | head -1
+  local_images | match_repo "$repo" 1 | head -1
 }
 
 echo "# Image digest pins captured $(date -u +%Y-%m-%dT%H:%M:%SZ) on $(hostname)"

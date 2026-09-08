@@ -17,9 +17,17 @@
 # Re-run after changing IRYS_CHAIN_ID; the path is per-chain.
 
 set -o pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || { echo "error: cannot cd to the repo root" >&2; exit 1; }
 
-CHAIN_ID="${IRYS_CHAIN_ID:-3282}"
+# shellcheck source=lib/stack.sh
+. "$(dirname "$0")/lib/stack.sh"
+
+# Reject anything that is not actually a PNG. The reason is the same on both paths below: this
+# file is served to the wallet as the native currency icon, so an HTML error page or a mistyped
+# argument would be rendered in its place.
+is_png() { [ "$(head -c8 "$1" | od -An -tx1 | tr -d ' \n')" = "89504e470d0a1a0a" ]; }
+
+CHAIN_ID=$(chain_id)
 MEDIA_DIR="${CFG_MEDIA_DIR:-./data/cfg-media}"
 DEST_REL="chains/${CHAIN_ID}/irys_currency.png"
 DEST="${MEDIA_DIR}/${DEST_REL}"
@@ -51,6 +59,9 @@ rm -f "$(dirname "$DEST")/.writetest"
 
 if [ -n "$SRC" ]; then
   [ -f "$SRC" ] || { echo "error: $SRC not found" >&2; exit 1; }
+  is_png "$SRC" || {
+    echo "error: $SRC is not a PNG (got $(file -b "$SRC" 2>/dev/null || echo unknown))" >&2
+    exit 1; }
   cp "$SRC" "$DEST" 2>/dev/null || { echo "error: could not write $DEST" >&2; exit 1; }
   sz=$(wc -c < "$DEST" 2>/dev/null || echo 0)
   [ "${sz:-0}" -gt 0 ] || { echo "error: $DEST is empty — write failed" >&2; exit 1; }
@@ -63,9 +74,7 @@ else
     echo "  bash scripts/install_currency_logo.sh /path/to/irys.png" >&2
     rm -f "$tmp"; exit 1
   fi
-  # Reject anything that is not actually a PNG -- an HTML error page written here would be
-  # served to the wallet as the currency icon.
-  if [ "$(head -c8 "$tmp" | od -An -tx1 | tr -d ' \n')" != "89504e470d0a1a0a" ]; then
+  if ! is_png "$tmp"; then
     echo "error: downloaded file is not a PNG (got $(file -b "$tmp" 2>/dev/null || echo unknown))" >&2
     rm -f "$tmp"; exit 1
   fi

@@ -47,6 +47,10 @@ LABEL irys.base-image="${UI_BASE_IMAGE}"
 # different id so it does not collide with the real network in a browser wallet (RUNBOOK s13).
 ARG IRYS_CHAIN_ID=3282
 ENV IRYS_CHAIN_ID=$IRYS_CHAIN_ID
+# Recorded for the same reason as irys.base-image above: the chain id is baked in, so a caller
+# has to be able to tell a built image's id from the one it is asking for and rebuild on a
+# mismatch. Without it a UI built for 3282 was served against a fork on another id.
+LABEL irys.chain-id="${IRYS_CHAIN_ID}"
 COPY docker/patch-irys-deployments.mjs /tmp/patch-irys-deployments.mjs
 RUN node /tmp/patch-irys-deployments.mjs
 

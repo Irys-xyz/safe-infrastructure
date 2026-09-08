@@ -27,6 +27,15 @@ const CHAIN_ID = process.env.IRYS_CHAIN_ID || '3282'
 const VERSION = 'v1.5.0'
 const TYPE = 'canonical'
 
+// safe-deployments keys networkAddresses by the decimal chain id as a string. A value that is
+// not one -- "0x0cd2", " 3282", "mainnet" -- would be registered under a key no consumer ever
+// looks up, and the REQUIRED check below would still pass, since the contracts *are* present:
+// just under a useless key. Fail the build instead.
+if (!/^[1-9][0-9]*$/.test(CHAIN_ID)) {
+  console.error(`irys-patch: FAILED — IRYS_CHAIN_ID must be a positive decimal chain id, got ${JSON.stringify(CHAIN_ID)}`)
+  process.exit(1)
+}
+
 // The contracts this stack actually depends on: the eight the Config Service records for the
 // chain (scripts/configure_irys.sh). If any is missing from the bundled package, fail the
 // build rather than ship a UI that silently cannot create or execute a Safe.
@@ -92,11 +101,23 @@ const patchDir = (dir) => {
   }
 }
 
-for (const root of ['dist', 'src']) patchDir(join(pkgRoot, root, 'assets', VERSION))
+// `dist` is what `next build` actually consumes, so patching only `src` is not a success:
+// track it separately rather than counting both directories together.
+let distPatched = false
+for (const root of ['dist', 'src']) {
+  const before = dirsSeen
+  patchDir(join(pkgRoot, root, 'assets', VERSION))
+  if (root === 'dist' && dirsSeen > before) distPatched = true
+}
 
 if (dirsSeen === 0) {
   console.error(`irys-patch: FAILED — no ${VERSION} asset directory under ${pkgRoot}/{dist,src}/assets`)
   console.error('The bundled @safe-global/safe-deployments predates the v1.5.0 assets, or its layout changed.')
+  process.exit(1)
+}
+if (!distPatched) {
+  console.error(`irys-patch: FAILED — ${pkgRoot}/dist/assets/${VERSION} is missing; only src was patched.`)
+  console.error('`next build` resolves the package through dist, so the built bundle would not have chain ' + CHAIN_ID + '.')
   process.exit(1)
 }
 

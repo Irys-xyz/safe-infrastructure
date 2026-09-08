@@ -38,11 +38,18 @@
 #   scripts/upgrade_test.sh diff before.json after.json
 #
 # Env: TEST_DIR (default ./.upgrade-test) is an isolated copy of the repo, so the test stack's
-# ./data never collides with a real deployment's.
+# ./data never collides with a real deployment's. The copy excludes .env,
+# container_env_files/*.env, ./data and ./backups, so the rehearsal runs on freshly generated
+# throwaway credentials rather than the operator's real ones.
 
 set -o pipefail
-cd "$(dirname "$0")/.."
+# ${BASH_SOURCE[0]} rather than $0, so the path is this file's even when it is sourced (tests/
+# does that to exercise the functions below directly), where $0 is the sourcing shell.
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || { echo "error: cannot cd to the repo root" >&2; exit 1; }
 REPO=$PWD
+
+# shellcheck source=lib/stack.sh
+. "$REPO/scripts/lib/stack.sh"
 
 TEST_DIR="${TEST_DIR:-$REPO/.upgrade-test}"
 PROJECT="${UPGRADE_TEST_PROJECT:-irysupg}"
@@ -56,6 +63,29 @@ UI_OVERLAY="-f docker-compose.ui-stub.yml"
 C() { (cd "$TEST_DIR" && docker compose -f docker-compose.yml -f docker-compose.local-chain.yml $UI_OVERLAY "$@"); }
 have_py() { command -v python3 >/dev/null || { echo "need python3" >&2; exit 1; }; }
 
+# The version a Safe service reports at its /about endpoint, empty if it cannot be read.
+# One definition for what was ten copies of this pipeline across probe, plan, snapshot and
+# the post-upgrade assertion.
+svc_version() {
+  curl -sS --max-time "${2:-20}" "$1" 2>/dev/null \
+    | python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",""))' 2>/dev/null
+}
+
+# The tag of an image reference, with any digest suffix removed. Named rather than inlined
+# because the naive form is wrong in a way that looks right: a digest-pinned reference is
+# repo:v6.10.1@sha256:..., so ${ref##*:} yields the digest hex, not the tag -- which reported a
+# correctly upgraded digest-pinned stack as FAIL.
+image_tag() { local r=${1%@*}; echo "${r##*:}"; }
+
+# The three services that report their own version, relative to a base URL.
+about_url() {
+  case $1 in
+    txs) echo "$2/txs/api/v1/about/" ;;
+    cfg) echo "$2/cfg/api/v1/about/" ;;
+    cgw) echo "$2/cgw/about" ;;
+  esac
+}
+
 # --- probe a live deployment -------------------------------------------------------------
 cmd_probe() {
   local url="${1:-$LIVE_URL_DEFAULT}"
@@ -63,12 +93,9 @@ cmd_probe() {
   echo "# Version set read over HTTP from $url on $(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2
   local cgw txs cfg ui
   # These three are authoritative: each service reports its own version.
-  cgw=$(curl -sS --max-time 20 "$url/cgw/about" 2>/dev/null \
-        | python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",""))' 2>/dev/null)
-  txs=$(curl -sS --max-time 20 "$url/txs/api/v1/about/" 2>/dev/null \
-        | python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",""))' 2>/dev/null)
-  cfg=$(curl -sS --max-time 20 "$url/cfg/api/v1/about/" 2>/dev/null \
-        | python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",""))' 2>/dev/null)
+  cgw=$(svc_version "$(about_url cgw "$url")")
+  txs=$(svc_version "$(about_url txs "$url")")
+  cfg=$(svc_version "$(about_url cfg "$url")")
   ui=$(cmd_probe_ui "$url")
   norm() { case "$1" in v*) echo "$1";; "") echo "";; *) echo "v$1";; esac; }
   cat <<EOF
@@ -230,9 +257,9 @@ cmd_plan() {
   echo "component                    deployed        latest          pushed"
   echo "---------------------------- --------------- --------------- ----------"
   local dep_cgw dep_txs dep_cfg dep_ui
-  dep_cgw=$(curl -sS --max-time 20 "$url/cgw/about" 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",""))' 2>/dev/null)
-  dep_txs=$(curl -sS --max-time 20 "$url/txs/api/v1/about/" 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",""))' 2>/dev/null)
-  dep_cfg=$(curl -sS --max-time 20 "$url/cfg/api/v1/about/" 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",""))' 2>/dev/null)
+  dep_cgw=$(svc_version "$(about_url cgw "$url")")
+  dep_txs=$(svc_version "$(about_url txs "$url")")
+  dep_cfg=$(svc_version "$(about_url cfg "$url")")
   dep_ui=$(cmd_probe_ui "$url")
   row() { printf '%-28s %-15s %-15s %s\n' "$1" "${2:-?}" "$(echo "$3"|awk '{print $1}')" "$(echo "$3"|awk '{print $2}')"; }
   row safe-transaction-service   "$dep_txs" "$(newest_tag safe-transaction-service)"
@@ -245,18 +272,51 @@ cmd_plan() {
 }
 
 # --- test stack lifecycle ----------------------------------------------------------------
+# TEST_DIR is documented as settable, and reset_data / `down` delete everything under its
+# ./data recursively. So refuse to touch a directory this script did not create -- a marker
+# file it writes itself. `TEST_DIR=$PWD upgrade_test.sh up ...` run from a live stack
+# directory would otherwise destroy all four production Postgres data directories.
+MARKER=.upgrade-test-dir
+
+assert_test_dir() {
+  [ "$TEST_DIR" != "$REPO" ] || {
+    echo "error: TEST_DIR must not be the repo root" >&2; exit 1; }
+  [ -f "$TEST_DIR/$MARKER" ] || {
+    echo "error: $TEST_DIR holds no $MARKER, so this script did not create it." >&2
+    echo "       Refusing to delete data under it. Use the default (.upgrade-test) or an" >&2
+    echo "       empty directory; 'up' creates the marker." >&2
+    exit 1; }
+}
+
 sync_test_dir() {
+  [ "$TEST_DIR" != "$REPO" ] || {
+    echo "error: TEST_DIR must not be the repo root" >&2; exit 1; }
+  if [ -e "$TEST_DIR" ] && [ ! -f "$TEST_DIR/$MARKER" ] && [ -n "$(ls -A "$TEST_DIR" 2>/dev/null)" ]; then
+    echo "error: $TEST_DIR is not empty and holds no $MARKER." >&2
+    echo "       This script overwrites the tree and wipes ./data under it; pick another TEST_DIR." >&2
+    exit 1
+  fi
   mkdir -p "$TEST_DIR"
-  tar -C "$REPO" -cf - --exclude=.git --exclude=data --exclude=.upgrade-test . | tar -C "$TEST_DIR" -xf -
-  # Real secrets are gitignored and not in the repo copy; generate throwaway ones for the test.
+  : > "$TEST_DIR/$MARKER"
+  # Copy the repo, NOT the operator's secrets. Being gitignored keeps .env and
+  # container_env_files/*.env out of the *repository*; it does nothing to keep them out of a
+  # tar of the working tree, which is what this is. Excluding them is what makes the rehearsal
+  # stack run on throwaway credentials -- without it it ran on the real DJANGO_SECRET_KEY, CGW
+  # AUTH_TOKEN, JWT_SECRET and FINGERPRINT_ENCRYPTION_KEY, and copied production dumps too.
+  tar -C "$REPO" -cf - \
+      --exclude=./.git --exclude=./data --exclude=./.upgrade-test \
+      --exclude=./.env --exclude='./container_env_files/*.env' --exclude=./backups \
+      . | tar -C "$TEST_DIR" -xf -
   local s p
   s=$(openssl rand -hex 32)
   # One password for every test database: docker-compose.yml passes $POSTGRES_PASSWORD to the
   # DB containers, and the service env files below must use the same value or nothing connects.
   p="${POSTGRES_PASSWORD:-$(openssl rand -hex 16)}"
   export POSTGRES_PASSWORD="$p"
+  mkdir -p "$TEST_DIR/container_env_files"
   for f in cfg cgw txs events ui; do
-    [ -f "$TEST_DIR/container_env_files/$f.env" ] && continue
+    # Written unconditionally: a `[ -f ] && continue` guard here is what let a copied real
+    # secrets file survive and be used instead of the throwaway one.
     sed -e "s/__CHANGE_ME__/$s/g" -e "s/__USER__/postgres/g" -e "s/__PASSWORD__/$p/g" \
         -e "s/__SAFE_DOMAIN__/localhost/g" \
         -e "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$p/" \
@@ -282,23 +342,51 @@ write_env() {
     echo "PUBLIC_RPC_NODE_URL=http://localhost:${LOCAL_CHAIN_PORT:-8546}"
     echo "UI_GATEWAY_URL=/cgw"
     [ -n "${LOCAL_FORK_BLOCK:-}" ] && echo "LOCAL_FORK_BLOCK=$LOCAL_FORK_BLOCK"
-    echo "POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}"
+    echo "POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?no test credentials yet -- run 'up' before 'upgrade'}"
     echo "RABBITMQ_USER=${RABBITMQ_USER:-safe}"
     echo "RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-$POSTGRES_PASSWORD}"
     grep -vE '^\s*(#|$)' "$vf"
   } > "$TEST_DIR/.env"
 }
 
-# Services that are not (running AND healthy-or-healthcheckless), one per line.
+# Services this run has asked compose to start. wait_healthy checks against this list rather
+# than against whatever `ps` happens to report, because a service compose FAILED to create has
+# no row in `ps` at all -- so it contributed nothing to the old check and a stack that never
+# came up was declared "all services healthy".
+STARTED=()
+
+# Bring services up and record them. Compose's output is no longer discarded: a failed create
+# used to be invisible here, which is the same lesson the `pull` step below already records.
+up_svc() {
+  local out svc
+  if ! out=$(C up -d "$@" 2>&1); then
+    printf '%s\n' "$out" | tail -6 | sed 's/^/    /'
+    echo "    ABORTING: compose could not start: $*" >&2
+    return 1
+  fi
+  for svc in "$@"; do
+    case "$svc" in -*) continue ;; esac   # skip flags like --no-deps
+    STARTED+=("$svc")
+  done
+}
+
+# Of the services started so far, those that are not (running AND healthy-or-healthcheckless),
+# one per line. A service with no row in `ps` counts as unhealthy, not as absent.
 unhealthy() {
-  C ps --format '{{.Service}} {{.State}} {{.Health}}' 2>/dev/null \
-    | awk 'NF>=2 && ($2!="running" || ($3!="" && $3!="healthy")){print $1}' | sort -u
+  local state svc
+  state=$(C ps -a --format '{{.Service}} {{.State}} {{.Health}}' 2>/dev/null)
+  for svc in "${STARTED[@]}"; do
+    printf '%s\n' "$state" | awk -v s="$svc" '
+      $1==s { seen=1; if ($2!="running" || ($3!="" && $3!="healthy")) bad=1 }
+      END   { if (!seen || bad) print s }'
+  done
 }
 
 wait_healthy() {
   local timeout=${1:-300}
   local end=$((SECONDS + timeout))
   local bad
+  [ "${#STARTED[@]}" -gt 0 ] || return 0
   while [ "$SECONDS" -lt "$end" ]; do
     bad=$(unhealthy | tr '\n' ' ')
     if [ -z "${bad// /}" ]; then echo "  all services healthy"; return 0; fi
@@ -314,26 +402,31 @@ cmd_up() {
   local vf=${1:?usage: up <versions.env>}
   vf=$(cd "$(dirname "$vf")" && pwd)/$(basename "$vf")
   sync_test_dir; write_env "$vf"
+  # Take any previous run down before reset_data: it deletes the bind-mounted Postgres files,
+  # and doing that under running containers corrupts them rather than resetting them.
+  C down -v --remove-orphans >/dev/null 2>&1
   reset_data
   echo "==> test dir $TEST_DIR  (project $PROJECT, proxy port $PORT)"
   grep -E 'VERSION|UI_BASE' "$TEST_DIR/.env" | sed 's/^/    /'
   echo "==> starting the fork"
-  C up -d anvil >/dev/null 2>&1
-  sleep 12
-  C logs anvil 2>&1 | grep -iE 'forking at|reproduce' | sed 's/^/    /' | head -2
+  # The overlay gives anvil a healthcheck, so wait on that rather than on a fixed sleep --
+  # forking a remote chain takes as long as it takes.
+  up_svc anvil || return 1
+  wait_healthy 120 || return 1
+  C logs anvil 2>&1 | grep -iE 'forking|reproduce' | sed 's/^/    /' | head -2
   echo "==> starting the backend"
-  C up -d txs-db cfg-db events-db cgw-db txs-redis cgw-redis txs-rabbitmq general-rabbitmq >/dev/null 2>&1
-  wait_healthy 180
-  C up -d txs-worker-indexer >/dev/null 2>&1
-  wait_healthy 420
-  C up -d cfg-web cgw-web events-web txs-web txs-scheduler \
-       txs-worker-contracts-tokens txs-worker-notifications-webhooks >/dev/null 2>&1
-  wait_healthy 300
+  up_svc txs-db cfg-db events-db cgw-db txs-redis cgw-redis txs-rabbitmq general-rabbitmq || return 1
+  wait_healthy 180 || return 1
+  up_svc txs-worker-indexer || return 1
+  wait_healthy 420 || return 1
+  up_svc cfg-web cgw-web events-web txs-web txs-scheduler \
+       txs-worker-contracts-tokens txs-worker-notifications-webhooks || return 1
+  wait_healthy 300 || return 1
   echo "==> starting the ui ($([ "${UI_REAL:-0}" = 1 ] && echo 'real image' || echo 'stub')) and nginx"
-  C up -d --no-deps ui >/dev/null 2>&1
-  C up -d --no-deps nginx >/dev/null 2>&1
-  wait_healthy 120
-  echo "==> applying the chain-3282 configuration"
+  up_svc --no-deps ui || return 1
+  up_svc --no-deps nginx || return 1
+  wait_healthy 120 || return 1
+  echo "==> applying the chain configuration (chain $(chain_id))"
   (cd "$TEST_DIR" && CONTAINER_RUNTIME=docker \
      COMPOSE_CMD="docker compose -f docker-compose.yml -f docker-compose.local-chain.yml $UI_OVERLAY" \
      bash scripts/configure_irys.sh 2>&1 | tail -6 | sed 's/^/    /')
@@ -367,16 +460,33 @@ cmd_upgrade() {
     echo "              'scripts/upgrade_test.sh latest' only offers tags built for it)" >&2
     return 1
   fi
+  # The wallet UI is not one of the pulled images: it is built here from UI_BASE_IMAGE. Without
+  # this the rehearsal could "pass" an upgrade in which the bundle under test was still the old
+  # one -- the single most important artefact in the set, since it renders what owners sign.
+  if [ "${UI_REAL:-0}" = 1 ]; then
+    echo "==> rebuilding the wallet UI from the requested base"
+    grep -E '^UI_BASE_IMAGE' "$vf" | sed 's/^/    /'
+    if ! C build ui 2>&1 | tail -5 | sed 's/^/    /'; then
+      echo "    ABORTING: the UI image did not build" >&2; return 1
+    fi
+  else
+    echo "==> skipping the UI (stub overlay; re-run with UI_REAL=1 to include it)"
+  fi
+
   echo "==> recreating (migrations run on start)"
-  if ! C up -d --no-deps txs-worker-indexer 2>&1 | tail -3 | sed 's/^/    /'; then
+  if ! up_svc --no-deps txs-worker-indexer; then
     echo "    ABORTING: could not recreate txs-worker-indexer" >&2; return 1
   fi
-  wait_healthy 420
-  if ! C up -d --no-deps cfg-web cgw-web events-web txs-web txs-scheduler \
-       txs-worker-contracts-tokens txs-worker-notifications-webhooks 2>&1 | tail -4 | sed 's/^/    /'; then
+  wait_healthy 420 || return 1
+  if ! up_svc --no-deps cfg-web cgw-web events-web txs-web txs-scheduler \
+       txs-worker-contracts-tokens txs-worker-notifications-webhooks; then
     echo "    ABORTING: could not recreate the services" >&2; return 1
   fi
-  wait_healthy 420
+  wait_healthy 420 || return 1
+  if [ "${UI_REAL:-0}" = 1 ]; then
+    up_svc --no-deps --force-recreate ui || return 1
+    wait_healthy 180 || return 1
+  fi
 
   # Three steps that are easy to miss and make a good upgrade look broken:
   #  1. nginx resolves upstream IPs once, at config load. Recreated containers get new IPs, so
@@ -404,8 +514,7 @@ assert_versions() {
   echo "==> verifying the running versions match the requested set"
   check() {
     local label=$1 url=$2 want=$3
-    got=$(curl -sS --max-time 20 "$url" 2>/dev/null \
-          | python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",""))' 2>/dev/null)
+    got=$(svc_version "$url")
     # Services report with and without the leading "v" inconsistently.
     if [ "${got#v}" = "${want#v}" ]; then
       printf '    ok   %-8s %s\n' "$label" "$got"
@@ -414,13 +523,14 @@ assert_versions() {
       bad=$((bad+1))
     fi
   }
-  # Primary check: the image the container is actually running. This is authoritative and not
-  # subject to caching or proxy staleness.
+  # The image the container is actually running: authoritative, and not subject to caching or
+  # proxy staleness.
   check_image() {
-    local svc=$1 want=$2 img
+    local svc=$1 want=$2 img tag
     img=$(C ps -q "$svc" 2>/dev/null | head -1)
     img=$(docker inspect "$img" --format '{{.Config.Image}}' 2>/dev/null)
-    if [ "${img##*:}" = "${want}" ] || [ "${img##*:}" = "${want#v}" ]; then
+    tag=$(image_tag "$img")
+    if [ "$tag" = "$want" ] || [ "$tag" = "${want#v}" ]; then
       printf '    ok   %-14s image %s\n' "$svc" "$img"
     else
       printf '    FAIL %-14s image %s, expected tag %s\n' "$svc" "${img:-<none>}" "$want"
@@ -431,10 +541,24 @@ assert_versions() {
   check_image cfg-web "$want_cfg"
   check_image cgw-web "$want_cgw"
   check_image txs-worker-indexer "$want_txs"
-  # Secondary: what the services report over HTTP, which is what clients actually see.
-  check txs "$base/txs/api/v1/about/" "$want_txs"
-  check cfg "$base/cfg/api/v1/about/" "$want_cfg"
-  check cgw "$base/cgw/about" "$want_cgw"
+  # The UI carries no version endpoint and no meaningful tag, so verify the base image its
+  # bundle was built from -- the value the version set actually pins.
+  if [ "${UI_REAL:-0}" = 1 ]; then
+    local want_base got_base uiid
+    want_base=$(sed -n 's/^UI_BASE_IMAGE=//p' "$vf" | head -1)
+    uiid=$(C ps -q ui 2>/dev/null | head -1)
+    got_base=$(docker inspect "$uiid" --format '{{index .Config.Labels "irys.base-image"}}' 2>/dev/null)
+    if [ -n "$want_base" ] && [ "$got_base" = "$want_base" ]; then
+      printf '    ok   %-14s base %s\n' ui "$got_base"
+    else
+      printf '    FAIL %-14s base %s, expected %s\n' ui "${got_base:-<none>}" "${want_base:-<unset>}"
+      bad=$((bad+1))
+    fi
+  fi
+  # What the services report over HTTP, which is what clients actually see.
+  check txs "$(about_url txs "$base")" "$want_txs"
+  check cfg "$(about_url cfg "$base")" "$want_cfg"
+  check cgw "$(about_url cgw "$base")" "$want_cgw"
   if [ "$bad" -gt 0 ]; then
     echo "    UPGRADE DID NOT TAKE EFFECT ($bad service(s) still on the old version)" >&2
     return 1
@@ -442,17 +566,21 @@ assert_versions() {
 }
 
 cmd_down() {
+  assert_test_dir
   echo "==> tearing down $PROJECT (including databases)"
   C down -v --remove-orphans 2>&1 | tail -3 | sed 's/^/    /'
   if [ -d "$TEST_DIR/data" ]; then
     echo "==> removing bind-mounted ./data (container-owned; needs a container to delete)"
-    docker run --rm -v "$TEST_DIR/data:/d" alpine:3 sh -c 'rm -rf /d/* /d/.[!.]* 2>/dev/null; true'
+    reset_data
     rmdir "$TEST_DIR/data" 2>/dev/null
   fi
 }
 
-# Same cleanup, used before a fresh `up` so a stale volume cannot poison the run.
+# Empty the bind-mounted ./data. The files are container-owned (root inside the containers),
+# so deleting them needs a container. Used by `down` and before a fresh `up`, so a stale
+# volume cannot poison the run.
 reset_data() {
+  assert_test_dir
   [ -d "$TEST_DIR/data" ] || return 0
   docker run --rm -v "$TEST_DIR/data:/d" alpine:3 sh -c 'rm -rf /d/* /d/.[!.]* 2>/dev/null; true'
 }
@@ -469,9 +597,9 @@ cmd_snapshot() {
     echo "{"
     echo "  \"captured\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
     echo "  \"versions\": {"
-    echo "    \"txs\": \"$(curl -sS --max-time 15 "$base/txs/api/v1/about/" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",""))' 2>/dev/null)\","
-    echo "    \"cfg\": \"$(curl -sS --max-time 15 "$base/cfg/api/v1/about/" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",""))' 2>/dev/null)\","
-    echo "    \"cgw\": \"$(curl -sS --max-time 15 "$base/cgw/about" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",""))' 2>/dev/null)\""
+    echo "    \"txs\": \"$(svc_version "$(about_url txs "$base")" 15)\","
+    echo "    \"cfg\": \"$(svc_version "$(about_url cfg "$base")" 15)\","
+    echo "    \"cgw\": \"$(svc_version "$(about_url cgw "$base")" 15)\""
     echo "  },"
     echo "  \"migrations\": {"
     echo "    \"txs\": $(psql_q txs-db 'select count(*) from django_migrations' | tr -d '[:space:]' || echo 0),"
@@ -518,11 +646,17 @@ def row(label, x, y, worse=None):
     print(f"{label:28} {str(x):>18} {str(y):>18}{flag}")
 print("versions")
 for k in a['versions']: row("  "+k, a['versions'][k], b['versions'].get(k))
+# Counted from here on, so that a regression the loops FLAG is also a regression they FAIL on.
+# `fails` used to be initialised after the migration loop, which meant a rehearsal that lost
+# migrations printed "<== REGRESSION" and then "RESULT: PASS", exiting 0 -- the precise
+# scenario this command exists to catch.
+fails=0
 print("migrations applied")
 for k in a['migrations']:
-    row("  "+k, a['migrations'][k], b['migrations'].get(k), lambda x,y: (y or 0) < (x or 0))
+    x=a['migrations'][k]; y=b['migrations'].get(k)
+    fails += (y or 0) < (x or 0)
+    row("  "+k, x, y, lambda p,q: (q or 0) < (p or 0))
 print("row counts")
-fails=0
 for k in a['rows']:
     x=a['rows'][k]; y=b['rows'].get(k)
     lost=(y or 0) < (x or 0)
@@ -548,6 +682,10 @@ print("RESULT: PASS -- migrations advanced and no state was lost.")
 PY
 }
 
+# Sourcing this file defines its functions without running a command, so the tests can exercise
+# them directly (tests/test_*.sh do). Executing it dispatches as usual.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
+
 case "${1:-}" in
   probe)      shift; cmd_probe "$@" ;;
   probe-host) shift; cmd_probe_host "$@" ;;
@@ -558,5 +696,5 @@ case "${1:-}" in
   snapshot) shift; cmd_snapshot "$@" ;;
   diff)     shift; cmd_diff "$@" ;;
   down)     shift; cmd_down "$@" ;;
-  *) sed -n '3,40p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) usage "$0"; exit 1 ;;
 esac

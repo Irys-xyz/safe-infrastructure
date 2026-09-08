@@ -27,22 +27,24 @@
 # Requires docker or podman. No local foundry install needed -- cast runs in the image.
 
 set -o pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || { echo "error: cannot cd to the repo root" >&2; exit 1; }
+
+# shellcheck source=lib/stack.sh
+. "$PWD/scripts/lib/stack.sh"
 
 NAME=irys-anvil-local
 PORT=8546
 RPC="http://localhost:${PORT}"
 IMAGE=ghcr.io/foundry-rs/foundry:latest
+# The fork's defaults (block time, fork lag) and its block-resolution rule live in
+# scripts/anvil-fork.sh, which the compose overlay runs too, so the two cannot drift. This
+# script only wires inputs into it and reports what came back.
+FORK_ENTRYPOINT=scripts/anvil-fork.sh
 UPSTREAM="${LOCAL_FORK_RPC:-https://mainnet-beta-rpc.irys.xyz/v1/execution-rpc}"
-# Chain id the fork serves. 3282 is Irys Mainnet; set IRYS_CHAIN_ID to something else so the
-# fork does not collide with the real network in a browser wallet (and build the UI image with
-# the same value -- it is baked in).
-CHAIN_ID="${IRYS_CHAIN_ID:-3282}"
-# Seconds between blocks. Default 9, matching measured Irys Mainnet (~8.8 s/block).
-# Without an interval anvil mines only when a transaction arrives, so the head
-# freezes right after inclusion and anything awaiting confirmations hangs forever (the wallet's
-# "Activating your account" step does). Real chains mine continuously; match that.
-BLOCK_TIME="${LOCAL_BLOCK_TIME:-9}"
+# Chain id the fork serves -- see chain_id() in lib/stack.sh. Set IRYS_CHAIN_ID to something
+# other than Irys Mainnet so the fork does not collide with the real network in a browser
+# wallet, and build the UI image with the same value: it is baked in.
+CHAIN_ID=$(chain_id)
 
 # Canonical Safe v1.5.0 on chain 3282 (verified on-chain; see scripts/verify_deployments.py).
 SINGLETON=0xEdd160fEBBD92E350D4D398fb636302fccd67C7e
@@ -60,11 +62,6 @@ RT=$(command -v docker || command -v podman) || { echo "error: need docker or po
 
 rpc() { timeout 10 curl -sS -X POST "$RPC" -H 'Content-Type: application/json' \
           -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":${2:-[]}}" 2>/dev/null; }
-# Same, but against the chain being forked (used to resolve a concrete fork block).
-up_rpc() { timeout 15 curl -sS -X POST "$UPSTREAM" -H 'Content-Type: application/json' \
-             -H 'User-Agent: curl/8' \
-             -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":${2:-[]}}" 2>/dev/null; }
-hexnum() { sed -n 's/.*"result":"\(0x[0-9a-fA-F]*\)".*/\1/p'; }
 # cast in a throwaway container; --network host so it can reach the fork on loopback.
 cast() { "$RT" run --rm --network host --entrypoint cast "$IMAGE" "$@"; }
 running() { "$RT" inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null | grep -q true; }
@@ -73,30 +70,16 @@ case "${1:-}" in
   start)
     if running; then echo "already running at $RPC (use '$0 stop' first to reset)"; exit 0; fi
     "$RT" rm -f "$NAME" >/dev/null 2>&1
-    args="--fork-url=$UPSTREAM --chain-id=$CHAIN_ID --host=0.0.0.0 --accounts=10 --balance=10000 --block-time $BLOCK_TIME"
-    want="${2:-}"
-    if [ "$want" = tip ]; then
-      # Explicitly unpinned: anvil resolves the tip itself. Different block every run.
-      echo "forking $UPSTREAM at current tip (unpinned — not reproducible)"
-    elif [ -n "$want" ]; then
-      args="$args --fork-block-number=$want"
-      echo "forking $UPSTREAM at block $want"
-    else
-      # No block given: resolve one now so the run is concrete and repeatable.
-      lag="${LOCAL_FORK_LAG:-10}"
-      tip=$(up_rpc eth_blockNumber | hexnum)
-      if [ -n "$tip" ]; then
-        want=$(( tip - lag ))
-        [ "$want" -lt 1 ] && want=1
-        args="$args --fork-block-number=$want"
-        echo "forking $UPSTREAM at block $want (tip $((tip)) minus LOCAL_FORK_LAG=$lag)"
-        echo "  re-run '$0 start $want' to reproduce this exact state"
-      else
-        echo "WARN: could not read the tip from $UPSTREAM — forking unpinned" >&2
-      fi
-    fi
-    # shellcheck disable=SC2086
-    "$RT" run -d --name "$NAME" -p "127.0.0.1:${PORT}:8545" --entrypoint anvil "$IMAGE" $args >/dev/null
+    # scripts/anvil-fork.sh resolves the block, so `start`, `start <block>` and `start tip` all
+    # map onto its LOCAL_FORK_BLOCK contract (empty / a number / the literal `tip`).
+    "$RT" run -d --name "$NAME" -p "127.0.0.1:${PORT}:8545" \
+      -v "$PWD/$FORK_ENTRYPOINT:/anvil-fork.sh:ro" \
+      -e "LOCAL_FORK_RPC=$UPSTREAM" \
+      -e "IRYS_CHAIN_ID=$CHAIN_ID" \
+      -e "LOCAL_BLOCK_TIME=${LOCAL_BLOCK_TIME:-}" \
+      -e "LOCAL_FORK_LAG=${LOCAL_FORK_LAG:-}" \
+      -e "LOCAL_FORK_BLOCK=${2:-}" \
+      --entrypoint sh "$IMAGE" /anvil-fork.sh >/dev/null
     printf 'waiting for the fork'
     for _ in $(seq 1 40); do
       [ -n "$(rpc eth_chainId)" ] && { echo; break; }
@@ -105,6 +88,9 @@ case "${1:-}" in
     if [ -z "$(rpc eth_chainId)" ]; then
       echo; echo "FAILED to start. Logs:"; "$RT" logs "$NAME" 2>&1 | tail -20; exit 1
     fi
+    # The entrypoint prints which block it forked at, and how to reproduce it; surface that here
+    # rather than resolving the block a second time on the host.
+    "$RT" logs "$NAME" 2>&1 | grep -iE 'forking|reproduce|WARN' | head -3 | sed 's/^/  /'
     bn=$(rpc eth_blockNumber | sed -n 's/.*"result":"\([^"]*\)".*/\1/p')
     echo "ready: chain $CHAIN_ID at $RPC (block $((bn)) )"
     echo "Point the stack at it with, in .env:"
@@ -170,7 +156,7 @@ case "${1:-}" in
     ;;
 
   *)
-    sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//'
+    usage "$0"
     exit 1
     ;;
 esac

@@ -15,7 +15,10 @@
 # standalone once the stack is healthy.
 
 set -o pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || { echo "error: cannot cd to the repo root" >&2; exit 1; }
+
+# shellcheck source=lib/stack.sh
+. "$(dirname "$0")/lib/stack.sh"
 
 set -a
 # shellcheck disable=SC1091
@@ -26,34 +29,38 @@ set +a
 # but the same script has to work under docker compose for local testing (RUNBOOK section 13) --
 # the two differ in both the exec command and the container naming scheme
 # (podman-compose: project_service_1, docker compose v2: project-service-1).
-RUNTIME="${CONTAINER_RUNTIME:-$(command -v podman || command -v docker)}"
-RUNTIME="$(basename "$RUNTIME")"
+RUNTIME=$(resolve_runtime)
 COMPOSE_CMD="${COMPOSE_CMD:-docker compose}"
 
-PROJECT="${COMPOSE_PROJECT_NAME:-$(basename "$PWD")}"
 # RPC the *services* use (resolved inside the container network).
 RPC="${RPC_NODE_URL:-https://mainnet-beta-rpc.irys.xyz/v1/execution-rpc}"
-# RPC the *browser* uses, written into the chain config the wallet reads. Normally identical,
-# so it defaults to $RPC. They must differ when the node is only reachable under different
-# names from the two sides -- e.g. the local-chain setup (§13), where the services reach anvil
-# at http://anvil:8545 but the browser must use http://localhost:8546.
+# RPC written into the chain config. The config service's Chain model has three RPC fields
+# (rpc_uri, safe_apps_rpc_uri, public_rpc_uri) and they are ALL served to clients in the
+# chains API -- there is no vpc_ variant the way there is for the transaction service, so the
+# in-network address cannot be advertised separately. All three therefore get the
+# browser-reachable URL, which is the only one the wallet can use to read state, build and
+# sign. Normally it is identical to $RPC.
+#
+# Consequence on the local-fork path (§13), where the two differ (services: http://anvil:8545,
+# browser: http://localhost:8546): the Client Gateway also builds its own RPC client from
+# rpc_uri, and that URL does not resolve inside its container. Its RPC-backed endpoints
+# (relay, counterfactual checks) therefore do not work against a local fork. The wallet does,
+# which is the trade the single field forces. Nothing changes in production, where both vars
+# hold the same public URL.
 PUBLIC_RPC="${PUBLIC_RPC_NODE_URL:-$RPC}"
-# Resolve a service to a container. Ask compose first (authoritative, naming-scheme agnostic),
-# then fall back to both conventional names so this works even if compose cannot be reached.
-cname() {
-  local svc=$1 id
-  id=$($COMPOSE_CMD ps -q "$svc" 2>/dev/null | head -1)
-  if [ -n "$id" ]; then echo "$id"; return 0; fi
-  for n in "${PROJECT}_${svc}_1" "${PROJECT}-${svc}-1"; do
-    if $RUNTIME inspect "$n" >/dev/null 2>&1; then echo "$n"; return 0; fi
-  done
-  echo "${PROJECT}_${svc}_1"   # last resort: let the caller fail with a clear name
-}
 
-cfg=$(cname cfg-web)
-txs=$(cname txs-web)
-cgw=$(cname cgw-web)
-eventsdb=$(cname events-db)
+# `exit` inside a command substitution only leaves the subshell, so the callers below have to
+# propagate the status themselves -- without the `|| exit 1` this printed one error per service
+# and then carried on with empty container names.
+svc_container() {
+  local c
+  c=$(cname "$1") || { echo "error: no container for service $1 -- is the stack up?" >&2; return 1; }
+  echo "$c"
+}
+cfg=$(svc_container cfg-web)      || exit 1
+txs=$(svc_container txs-web)      || exit 1
+cgw=$(svc_container cgw-web)      || exit 1
+eventsdb=$(svc_container events-db) || exit 1
 
 filter='rusty-rlp|objects imported|Triggering CGW|new HTTP connection|hooks/events HTTP|FeatureChains'
 
@@ -61,10 +68,9 @@ filter='rusty-rlp|objects imported|Triggering CGW|new HTTP connection|hooks/even
 # Set IRYS_PUBLIC_ORIGIN=https://safe.irys.xyz (Ansible does) to advertise the real origin.
 PUBLIC_TXS_URI="${IRYS_PUBLIC_ORIGIN:+${IRYS_PUBLIC_ORIGIN}/txs}"
 
-# Chain id to configure. 3282 is Irys Mainnet (production). A local fork can run under a
-# different id so it does not collide with the real Irys network in a browser wallet; build the
-# UI image with the same IRYS_CHAIN_ID, since it is baked in (RUNBOOK section 13).
-CHAIN_ID="${IRYS_CHAIN_ID:-3282}"
+# Chain id to configure -- see chain_id() in lib/stack.sh. Build the UI image with the same
+# IRYS_CHAIN_ID, since it is baked in (RUNBOOK section 13).
+CHAIN_ID=$(chain_id)
 
 echo "==> Config Service: chain $CHAIN_ID, contracts, features, WALLET_WEB service"
 $RUNTIME exec -e CHAIN_RPC="$PUBLIC_RPC" -e PUBLIC_TXS_URI="$PUBLIC_TXS_URI" \
@@ -108,8 +114,10 @@ defaults = dict(
     # for chain 3282. Setting it to anything would just produce failed lookups. ERC-20 tokens
     # on Irys therefore have no fiat value until CoinGecko lists the chain.
     prices_provider_native_coin=os.environ.get("PRICES_NATIVE_COIN") or "irys",
-    # Set below, only if the image really exists in MEDIA_ROOT -- pointing at a missing file
-    # makes the wallet render the native currency as a generic unknown token.
+    # currency_logo_uri is deliberately absent here and set after the chain is saved, only if
+    # the image really exists in MEDIA_ROOT -- pointing at a missing file makes the wallet
+    # render the native currency as a generic unknown token.
+    #
     # transaction_service_uri is public (served to browsers in the chain config); the vpc_ one is
     # the in-network address the Client Gateway calls. Keeping the internal http://nginx:8000 in
     # the public field leaks the container topology and breaks any client that reads it.
@@ -144,12 +152,24 @@ else:
 # so configure a fixed EIP-1559 pair (it reports baseFeePerGas ~7 wei and a 1 gwei priority
 # fee, so 1 gwei priority / 3 gwei cap is ample headroom). Override via the env if that changes.
 from chains.models import GasPrice
+
+def _wei(var, default):
+    raw = os.environ.get(var) or ""
+    if not raw:
+        return default
+    if not raw.strip().isdigit():
+        raise SystemExit("    ERROR: %s must be a decimal number of wei, got %r" % (var, raw))
+    return int(raw)
+
+# rank is part of the lookup, not just the defaults: GasPrice is a per-chain *ranked*
+# collection, so several rows per chain are a supported state. Filtering on chain alone raised
+# MultipleObjectsReturned as soon as a second row existed (one added through the admin), which
+# aborted this script after the chain was written but before the features and the webhook.
 GasPrice.objects.update_or_create(
-    chain=chain,
+    chain=chain, rank=100,
     defaults=dict(
-        rank=100,
-        max_fee_per_gas=int(os.environ.get("GAS_MAX_FEE_WEI") or 3_000_000_000),
-        max_priority_fee_per_gas=int(os.environ.get("GAS_MAX_PRIORITY_FEE_WEI") or 1_000_000_000),
+        max_fee_per_gas=_wei("GAS_MAX_FEE_WEI", 3_000_000_000),
+        max_priority_fee_per_gas=_wei("GAS_MAX_PRIORITY_FEE_WEI", 1_000_000_000),
     ),
 )
 print("    gas price configured (fixed EIP-1559)")

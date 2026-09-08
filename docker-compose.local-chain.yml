@@ -19,58 +19,22 @@ services:
   anvil:
     image: ghcr.io/foundry-rs/foundry:latest
     restart: unless-stopped
+    # Every default and the block-resolution rule live in scripts/anvil-fork.sh, which
+    # scripts/local_testnet.sh runs too -- see its header. Only the wiring is here.
     environment:
-      LOCAL_FORK_RPC: ${LOCAL_FORK_RPC:-https://mainnet-beta-rpc.irys.xyz/v1/execution-rpc}
-      # Pin the fork block for a reproducible starting state. Leave unset to fork at the tip.
-      # (Built as a shell arg rather than a compose list entry because the flag must be OMITTED
-      # when unpinned -- passing --fork-block-number=0 would fork at genesis, where none of the
-      # Safe contracts exist yet, which is the opposite of what this overlay is for.)
+      LOCAL_FORK_RPC: ${LOCAL_FORK_RPC:-}
+      # Pin the fork block for a reproducible starting state. Leave unset to fork at
+      # (tip - LOCAL_FORK_LAG); set it to `tip` to fork at the tip unpinned.
       LOCAL_FORK_BLOCK: ${LOCAL_FORK_BLOCK:-}
-      # Blocks to stay behind the tip when LOCAL_FORK_BLOCK is unset. Matches
-      # scripts/local_testnet.sh, which uses the same default.
-      LOCAL_FORK_LAG: ${LOCAL_FORK_LAG:-10}
+      LOCAL_FORK_LAG: ${LOCAL_FORK_LAG:-}
       # Chain id the fork serves. Default 3282 (Irys Mainnet). Set it to something else so the
       # fork does not collide with the real Irys network already in a browser wallet, and build
       # the UI image with the same IRYS_CHAIN_ID (it is baked in).
-      IRYS_CHAIN_ID: ${IRYS_CHAIN_ID:-3282}
-      # Seconds between blocks. Default 9 to match measured Irys Mainnet (~8.8 s/block), so
-      # confirmation timing behaves like the real chain. MUST be set at all: by default anvil
-      # only mines when a transaction
-      # arrives, so the chain head freezes the instant a transaction is included. Anything
-      # waiting for confirmations *after* inclusion then hangs forever -- the wallet's
-      # "Activating your account" step does exactly that, and never completes. A real chain
-      # produces blocks continuously, so mine on an interval to match it.
-      LOCAL_BLOCK_TIME: ${LOCAL_BLOCK_TIME:-9}
-    entrypoint: ["sh", "-c"]
-    command:
-      - |
-        set -e
-        # Deterministic funded test accounts: same keys every run.
-        # NEVER use these keys anywhere real -- they are published in anvil's source.
-        ARGS="--fork-url=$${LOCAL_FORK_RPC} --chain-id=$${IRYS_CHAIN_ID} --host=0.0.0.0 --accounts=10 --balance=10000 --block-time $${LOCAL_BLOCK_TIME}"
-        PIN="$${LOCAL_FORK_BLOCK}"
-        if [ "$${PIN}" = tip ]; then
-          # Explicitly unpinned: anvil resolves the tip itself. Different block every run.
-          echo "forking at current tip (unpinned - not reproducible)"
-          PIN=""
-        elif [ -z "$${PIN}" ]; then
-          # Resolve a concrete block so the run is repeatable, and stay a little behind the
-          # tip: the newest block is the least reliable to fork (state may not have settled,
-          # and it can still be reorged away).
-          TIP=$$(cast block-number --rpc-url "$${LOCAL_FORK_RPC}" 2>/dev/null || echo "")
-          if [ -n "$${TIP}" ]; then
-            PIN=$$(( TIP - LOCAL_FORK_LAG ))
-            [ "$${PIN}" -lt 1 ] && PIN=1
-            echo "forking at block $${PIN} (tip $${TIP} minus LOCAL_FORK_LAG=$${LOCAL_FORK_LAG})"
-            echo "  set LOCAL_FORK_BLOCK=$${PIN} to reproduce this exact state"
-          else
-            echo "WARN: could not read the tip - forking unpinned" >&2
-          fi
-        else
-          echo "forking at pinned block $${PIN}"
-        fi
-        [ -n "$${PIN}" ] && ARGS="$$ARGS --fork-block-number=$${PIN}"
-        exec anvil $$ARGS
+      IRYS_CHAIN_ID: ${IRYS_CHAIN_ID:-}
+      LOCAL_BLOCK_TIME: ${LOCAL_BLOCK_TIME:-}
+    volumes:
+      - ./scripts/anvil-fork.sh:/anvil-fork.sh:ro
+    entrypoint: ["sh", "/anvil-fork.sh"]
     ports:
       # Loopback only: the browser and MetaMask reach the chain here. Services use anvil:8545.
       # Parameterised so two forks can run side by side (e.g. an interactive test chain and an

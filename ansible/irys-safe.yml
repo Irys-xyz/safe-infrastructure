@@ -130,6 +130,14 @@
       ansible.builtin.assert:
         that:
           - irys_action in ['install', 'start', 'stop', 'restart', 'status']
+          # A typo here used to skip BOTH deploy tasks (their `when:` clauses match 'git' and
+          # 'rsync' exactly) and then carry on rendering .env and starting the stack on
+          # whatever checkout was already on the host. A deploy that silently deploys nothing
+          # is worse than one that fails.
+          - irys_deploy_method in ['git', 'rsync']
+          # The vars.example.yml placeholder, so an unedited copy fails here rather than at
+          # `git fetch` halfway through a deploy.
+          - irys_deploy_method != 'git' or irys_repo_version != 'REPLACE_WITH_A_TAG_OR_SHA'
           - stack_user is defined and stack_user | length > 0
           # Infrastructure credentials are single-sourced into the repo-root .env, so they are
           # gated here rather than in the per-service env files (where the same values are inert
@@ -159,7 +167,9 @@
           To deploy against a host whose databases still hold the upstream
           defaults and rotate afterwards, set the existing values and add
           irys_accept_default_credentials: true (RUNBOOK section 10).
-          irys_action must be one of install, start, stop, restart, status.
+          irys_action must be one of install, start, stop, restart, status, and
+          irys_deploy_method one of git, rsync. With the git method, set
+          irys_repo_version to a tag or commit SHA.
 
   tasks:
     - name: WARN — deploying with default infrastructure credentials
@@ -318,6 +328,45 @@
           environment:
             HOME: "{{ stack_home }}"
             PATH: "{{ stack_home }}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+        # The git module clones into an empty directory or updates an existing repository; it
+        # cannot adopt a populated directory that is not one. Every host provisioned by the
+        # previous rsync deploy is exactly that (rsync excluded .git), so the first deploy on
+        # the new default would fail mid-run with "destination path already exists and is not
+        # an empty directory". Say so here, before anything has been changed, and give the
+        # one-time migration.
+        - name: Check for an rsync-populated directory that is not a git checkout
+          ansible.builtin.stat:
+            path: "{{ irys_dir }}/.git"
+          register: irys_dir_git
+          become: true
+          become_user: "{{ stack_user }}"
+          when: irys_deploy_method == 'git'
+
+        - name: Check whether the deployment directory exists at all
+          ansible.builtin.stat:
+            path: "{{ irys_dir }}"
+          register: irys_dir_stat
+          become: true
+          become_user: "{{ stack_user }}"
+          when: irys_deploy_method == 'git'
+
+        - name: Require a git checkout (or nothing) at the deployment path
+          ansible.builtin.assert:
+            that:
+              - not irys_dir_stat.stat.exists or irys_dir_git.stat.exists
+            fail_msg: >-
+              {{ irys_dir }} exists but is not a git checkout — this host was provisioned by
+              the older rsync deploy. Adopt it once, as {{ stack_user }} on the host, which
+              keeps .env, container_env_files/*.env and ./data in place:
+              cd {{ irys_dir }} && git init -b main &&
+              git remote add origin {{ irys_repo_url }} &&
+              git fetch origin {{ irys_repo_version }} &&
+              git reset FETCH_HEAD && git checkout .
+              Then re-run. Alternatively set irys_deploy_method: rsync to keep the old
+              behaviour, or move the directory aside and let this play clone afresh (you must
+              then restore .env, container_env_files/*.env and ./data yourself).
+          when: irys_deploy_method == 'git'
 
         - name: Check out the pinned revision on the host
           ansible.builtin.git:
@@ -541,6 +590,23 @@
               Set irys_safe_domain and provide irys_origin_cert / irys_origin_key (the Cloudflare
               Origin Certificate PEM and key, vaulted). Generate them in Cloudflare: SSL/TLS ->
               Origin Server -> Create Certificate. See ansible/vars.example.yml.
+
+        # The Caddyfile derives trusted_leaf_cert from this variable by stripping the PEM
+        # markers and all whitespace. A value holding a full chain (leaf + intermediate) would
+        # concatenate two base64 blobs into one invalid pin, and with `mode require` the
+        # failure mode is every handshake rejected -- the site dark, from a variable that looks
+        # fine. Cloudflare's Origin Certificate download is a single certificate; insist on it.
+        - name: Require exactly one certificate in irys_origin_cert
+          ansible.builtin.assert:
+            that:
+              - irys_origin_cert | regex_findall('-----BEGIN CERTIFICATE-----') | length == 1
+            fail_msg: >-
+              irys_origin_cert must hold exactly ONE certificate (the Cloudflare Origin
+              Certificate leaf), not a chain: the Authenticated Origin Pulls pin is derived
+              from it and a concatenated chain produces an invalid pin that rejects every
+              connection. Found
+              {{ irys_origin_cert | regex_findall('-----BEGIN CERTIFICATE-----') | length }}.
+          when: irys_cf_authenticated_origin_pull | default(true)
 
         - name: Install the Cloudflare Origin certificate
           ansible.builtin.copy:
