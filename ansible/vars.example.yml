@@ -6,6 +6,19 @@ stack_user: irys                 # unprivileged user that owns + runs the stack 
                                  # Recommended: also your ansible_user, so the rsync deploy
                                  # lands writable by the stack.
 
+# --- how the code reaches the host ---
+# git (default) checks out a pinned revision and records it in DEPLOYED_REVISION.
+#
+# Set this to a tag or a full commit SHA, not a branch. A branch name is resolved at deploy
+# time, so two runs of the same playbook can land different code and DEPLOYED_REVISION is the
+# only record of which -- which defeats the point of deploying from a revision at all.
+# Get the current one with: git rev-parse HEAD
+irys_repo_version: REPLACE_WITH_A_TAG_OR_SHA
+# irys_repo_url: https://github.com/Irys-xyz/safe-infrastructure.git
+# Set to rsync to push your local working copy instead — uncommitted changes included.
+# Fine for a test host, not for production.
+# irys_deploy_method: rsync
+
 # --- stack config ---
 irys_rpc_node_url: https://mainnet-beta-rpc.irys.xyz/v1/execution-rpc
 irys_reverse_proxy_port: 8000
@@ -15,11 +28,49 @@ irys_project_name: irys-safe-infrastructure
 # Override with an absolute URL only for a Client Gateway served from a different origin than the UI:
 #   irys_ui_gateway_url: https://safe.irys.xyz/cgw
 
-# Pin to exact tags for reproducibility (RUNBOOK section 10).
+# Image tags. `latest` is fine for a first bring-up, but pin BOTH the tag and the digest below
+# before anything real depends on this stack (RUNBOOK section 10).
 irys_txs_version: latest
 irys_cfg_version: latest
 irys_cgw_version: latest
 irys_events_version: latest
+
+# Image digest pins — the actual reproducibility control. A tag is mutable; a digest is not.
+# Run `bash scripts/pin_image_digests.sh` on the host after a bring-up you have validated: it
+# prints these lines with the digests you are currently running, ready to paste here. Leave
+# them unset and you get whatever the registry served at first pull, with no record of what.
+# irys_txs_digest: "@sha256:..."
+# irys_cfg_digest: "@sha256:..."
+# irys_cgw_digest: "@sha256:..."
+# irys_events_digest: "@sha256:..."
+# irys_postgres_digest: "@sha256:..."
+# irys_redis_digest: "@sha256:..."
+# irys_rabbitmq_digest: "@sha256:..."
+# irys_nginx_digest: "@sha256:..."
+
+# Base image for the derived wallet UI. The highest-value pin in this file: this image is the
+# code that constructs and displays what Safe owners are asked to sign. Repinning it rebuilds
+# the UI image and recreates the container on the next deploy.
+# irys_ui_base_image: docker.io/safeglobal/safe-wallet-web@sha256:...
+
+# --- required: infrastructure credentials (VAULT THESE) ---
+# docker-compose.yml configures both the Postgres/RabbitMQ servers AND the services that connect
+# to them from these values, so there is exactly one place to set each. Generate with
+# `openssl rand -hex 32` and vault with `ansible-vault encrypt_string`.
+# NOTE: changing irys_postgres_password on a host whose ./data already exists does NOT change the
+# stored password -- Postgres only reads it at initdb. Run ALTER USER in each database too
+# (RUNBOOK section 10) or every service will fail to authenticate.
+irys_postgres_password: CHANGE_ME
+irys_rabbitmq_user: safe
+irys_rabbitmq_password: CHANGE_ME
+
+# Deploying against an EXISTING host whose databases still hold the upstream defaults?
+# Postgres only reads POSTGRES_PASSWORD at initdb and RabbitMQ only reads its default
+# credentials on first boot, so a new password here does not change what they accept --
+# every service would fail to authenticate. To ship other changes now and rotate later,
+# set the values above to what the host already uses and uncomment this. It prints a loud
+# warning on every deploy, deliberately. Rotation procedure: RUNBOOK section 10.
+# irys_accept_default_credentials: true
 
 # --- optional: auto-create admin users on first start (vault the passwords) ---
 # irys_cfg_superuser_username: root
@@ -56,10 +107,11 @@ irys_origin_key: |
 # list in irys-safe.yml is the fallback).
 # irys_cloudflare_fetch_ips: true
 
-# Authenticated Origin Pulls (zone-level mTLS): Caddy requires Cloudflare's client certificate,
-# so the origin rejects anything that is not Cloudflare — even from within CF's IP ranges. ENABLE
-# it in the Cloudflare dashboard (SSL/TLS -> Origin Server -> Authenticated Origin Pulls, zone-
-# level) BEFORE deploying, or the site goes dark. Set false to skip the mTLS requirement.
+# Authenticated Origin Pulls (zone-level mTLS): Cloudflare presents the zone's own Origin CA
+# certificate (the irys_origin_cert above) as its client certificate, and Caddy pins that exact
+# leaf — so the origin rejects anything that is not Cloudflare, even from within CF's IP ranges.
+# ENABLE it in the Cloudflare dashboard (SSL/TLS -> Origin Server -> Authenticated Origin Pulls,
+# zone-level) BEFORE deploying, or the site goes dark. Set false to skip the mTLS requirement.
 # irys_cf_authenticated_origin_pull: true
 
 # Disable SSH password authentication (key-only). root already has a key; the irys stack user

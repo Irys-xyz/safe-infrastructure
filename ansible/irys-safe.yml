@@ -43,10 +43,10 @@
     irys_origin_cert_path: /etc/caddy/origin.crt
     irys_origin_key_path: /etc/caddy/origin.key
     irys_cloudflare_fetch_ips: true
-    # Authenticated Origin Pulls (zone-level mTLS): Caddy requires Cloudflare's client cert.
+    # Authenticated Origin Pulls (zone-level mTLS): Caddy pins the zone's own Origin CA cert,
+    # which Cloudflare presents as its client certificate (see Caddyfile.j2).
     # Enable it in the Cloudflare dashboard BEFORE deploying, or the origin rejects everything.
     irys_cf_authenticated_origin_pull: true
-    irys_cf_aop_ca_path: /etc/caddy/cloudflare-aop-ca.pem
     # Bundled Cloudflare ranges; refreshed from cloudflare.com at deploy when the toggle is on.
     cloudflare_ipv4:
       - 173.245.48.0/20
@@ -77,13 +77,24 @@
     subid_start: 100000
     subid_count: 65536
 
-    # Local working copy pushed to the host (repo root = the Ansible dir's parent).
+    # How the code reaches the host.
+    #   git   (default) check out a pinned revision from the remote. The host then records
+    #         what it is running, and only reviewed, pushed commits can be deployed.
+    #   rsync push this working copy as-is, uncommitted changes included. Convenient for
+    #         iterating against a test host; unsuitable for production, because the
+    #         deployed artifact has no identity and anything uncommitted becomes live.
+    irys_deploy_method: git
+    irys_repo_url: https://github.com/Irys-xyz/safe-infrastructure.git
+    irys_repo_version: main
+    # Local working copy, used only by the rsync method (repo root = the Ansible dir's parent).
     irys_src_dir: "{{ playbook_dir | dirname }}"
     # Derived from the resolved stack user (lazy-evaluated once stack_* are set).
     irys_dir: "{{ stack_home }}/irys-safe-infrastructure"
     xdg_env:
       XDG_RUNTIME_DIR: "/run/user/{{ stack_uid }}"
       DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ stack_uid }}/bus"
+    # The five per-service secret files, provisioned out-of-band on the host.
+    irys_env_files_list: [cfg.env, cgw.env, txs.env, events.env, ui.env]
 
     apt_packages:
       - podman
@@ -101,6 +112,7 @@
       - aardvark-dns
       - fuse-overlayfs
       - rsync
+      - git
       - curl
       - acl
       # Edge hardening: TLS reverse proxy (Caddy), host firewall (nftables), and an SSH
@@ -118,12 +130,60 @@
       ansible.builtin.assert:
         that:
           - irys_action in ['install', 'start', 'stop', 'restart', 'status']
+          # A typo here used to skip BOTH deploy tasks (their `when:` clauses match 'git' and
+          # 'rsync' exactly) and then carry on rendering .env and starting the stack on
+          # whatever checkout was already on the host. A deploy that silently deploys nothing
+          # is worse than one that fails.
+          - irys_deploy_method in ['git', 'rsync']
+          # The vars.example.yml placeholder, so an unedited copy fails here rather than at
+          # `git fetch` halfway through a deploy.
+          - irys_deploy_method != 'git' or irys_repo_version != 'REPLACE_WITH_A_TAG_OR_SHA'
           - stack_user is defined and stack_user | length > 0
+          # Infrastructure credentials are single-sourced into the repo-root .env, so they are
+          # gated here rather than in the per-service env files (where the same values are inert
+          # and overridden by docker-compose.yml). Set irys_accept_default_credentials=true to
+          # deploy against a host whose databases still hold the upstream defaults and rotate
+          # later -- see the warning it prints, and RUNBOOK section 10 for the rotation.
+          - irys_action != 'install' or irys_accept_default_credentials | default(false)
+              or (irys_postgres_password is defined
+              and irys_postgres_password | length >= 16
+              and irys_postgres_password != 'CHANGE_ME'
+              and irys_postgres_password != 'postgres')
+          - irys_action != 'install' or irys_accept_default_credentials | default(false)
+              or (irys_rabbitmq_password is defined
+              and irys_rabbitmq_password | length >= 16
+              and irys_rabbitmq_password != 'CHANGE_ME'
+              and irys_rabbitmq_password != 'guest')
+          # Even with the opt-out, the values must be set to *something* -- compose feeds them
+          # to both the servers and the clients, and an empty password stops Postgres starting.
+          - irys_action != 'install' or (irys_postgres_password is defined
+              and irys_postgres_password | length > 0)
+          - irys_action != 'install' or (irys_rabbitmq_password is defined
+              and irys_rabbitmq_password | length > 0)
         fail_msg: >-
-          Set stack_user. irys_action must be one of install, start, stop,
-          restart, status.
+          Set stack_user, and (for install) irys_postgres_password and
+          irys_rabbitmq_password to vaulted values of at least 16 characters --
+          not CHANGE_ME, and not the upstream defaults 'postgres' / 'guest'.
+          To deploy against a host whose databases still hold the upstream
+          defaults and rotate afterwards, set the existing values and add
+          irys_accept_default_credentials: true (RUNBOOK section 10).
+          irys_action must be one of install, start, stop, restart, status, and
+          irys_deploy_method one of git, rsync. With the git method, set
+          irys_repo_version to a tag or commit SHA.
 
   tasks:
+    - name: WARN — deploying with default infrastructure credentials
+      ansible.builtin.debug:
+        msg: >-
+          irys_accept_default_credentials is set, so the credential strength check was
+          skipped. The databases and message broker are reachable with credentials
+          published in the upstream repository. This is survivable only because they sit
+          on a private container network with no published ports — any code execution
+          inside that network reaches all four databases. Rotate as soon as the urgent
+          work is done: RUNBOOK section 10 (it needs ALTER USER inside each database and
+          a broker recreate, not just an edit here).
+      when: irys_accept_default_credentials | default(false)
+
     # --- install: system preparation (root) -------------------------------
     - name: System preparation
       when: irys_action == 'install'
@@ -269,6 +329,75 @@
             HOME: "{{ stack_home }}"
             PATH: "{{ stack_home }}/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
+        # The git module clones into an empty directory or updates an existing repository; it
+        # cannot adopt a populated directory that is not one. Every host provisioned by the
+        # previous rsync deploy is exactly that (rsync excluded .git), so the first deploy on
+        # the new default would fail mid-run with "destination path already exists and is not
+        # an empty directory". Say so here, before anything has been changed, and give the
+        # one-time migration.
+        - name: Check for an rsync-populated directory that is not a git checkout
+          ansible.builtin.stat:
+            path: "{{ irys_dir }}/.git"
+          register: irys_dir_git
+          become: true
+          become_user: "{{ stack_user }}"
+          when: irys_deploy_method == 'git'
+
+        - name: Check whether the deployment directory exists at all
+          ansible.builtin.stat:
+            path: "{{ irys_dir }}"
+          register: irys_dir_stat
+          become: true
+          become_user: "{{ stack_user }}"
+          when: irys_deploy_method == 'git'
+
+        - name: Require a git checkout (or nothing) at the deployment path
+          ansible.builtin.assert:
+            that:
+              - not irys_dir_stat.stat.exists or irys_dir_git.stat.exists
+            fail_msg: >-
+              {{ irys_dir }} exists but is not a git checkout — this host was provisioned by
+              the older rsync deploy. Adopt it once, as {{ stack_user }} on the host, which
+              keeps .env, container_env_files/*.env and ./data in place:
+              cd {{ irys_dir }} && git init -b main &&
+              git remote add origin {{ irys_repo_url }} &&
+              git fetch origin {{ irys_repo_version }} &&
+              git reset FETCH_HEAD && git checkout .
+              Then re-run. Alternatively set irys_deploy_method: rsync to keep the old
+              behaviour, or move the directory aside and let this play clone afresh (you must
+              then restore .env, container_env_files/*.env and ./data yourself).
+          when: irys_deploy_method == 'git'
+
+        - name: Check out the pinned revision on the host
+          ansible.builtin.git:
+            repo: "{{ irys_repo_url }}"
+            dest: "{{ irys_dir }}"
+            version: "{{ irys_repo_version }}"
+            # Refuse to discard local modifications rather than silently clobbering them.
+            # A dirty tree means someone edited the host directly; that needs a human, not
+            # a --force. Gitignored files (.env, container_env_files/*.env, data/) are
+            # untouched by a checkout, so they survive.
+            force: false
+          become: true
+          become_user: "{{ stack_user }}"
+          when: irys_deploy_method == 'git'
+          register: irys_git
+          notify: Restart irys-safe stack
+
+        - name: Record what was deployed
+          ansible.builtin.copy:
+            dest: "{{ irys_dir }}/DEPLOYED_REVISION"
+            content: |
+              revision={{ irys_git.after | default('unknown') }}
+              requested={{ irys_repo_version }}
+              repo={{ irys_repo_url }}
+              deployed_at={{ ansible_date_time.iso8601 | default('unknown') }}
+              method=git
+            owner: "{{ stack_user }}"
+            group: "{{ stack_user }}"
+            mode: "0644"
+          when: irys_deploy_method == 'git'
+
         - name: Sync the working copy to the host (rsync)
           ansible.posix.synchronize:
             src: "{{ irys_src_dir }}/"
@@ -283,20 +412,18 @@
               - "--exclude=.env"
               - "--exclude=claude"
               - "--exclude=.idea"
+              - "--exclude=.upgrade-test"
+              - "--exclude=backups"
               - "--exclude=ansible/inventory.ini"
               - "--exclude=ansible/vars.yml"
+              - "--exclude=versions/deployed.env"
               # Per-service secrets are gitignored and provisioned out-of-band; the *.env.example
               # templates still sync. Place container_env_files/*.env on a fresh host before start.
               - "--exclude=container_env_files/*.env"
           become: false
+          when: irys_deploy_method == 'rsync'
           notify: Restart irys-safe stack
 
-        # Re-own the rsynced code tree to the stack user, but never recurse into ./data.
-        # The postgres subdirs there are chowned to container uid 70 (mapped through the
-        # rootless userns); a blanket `chown -R {{ irys_dir }}` would re-map them to the stack
-        # user (= container root), postgres would lose access to its own files, and every *-db
-        # container would crash-loop on the next install. rsync already excludes ./data, so
-        # podman alone owns what lives under it -- prune it from the chown.
         - name: Ensure the deployed tree (excluding ./data) is owned by the stack user
           ansible.builtin.command:
             argv:
@@ -313,6 +440,14 @@
               - +
           become: true
           changed_when: true
+
+        - name: Ensure the Config Service media directory exists and is writable
+          ansible.builtin.file:
+            path: "{{ irys_dir }}/data/cfg-media"
+            state: directory
+            owner: "{{ stack_user }}"
+            group: "{{ stack_user }}"
+            mode: "0755"
 
         - name: Render the repo-root .env
           ansible.builtin.template:
@@ -341,12 +476,7 @@
         - name: Stat the per-service secret files (not synced — must exist on the host)
           ansible.builtin.stat:
             path: "{{ irys_dir }}/container_env_files/{{ item }}"
-          loop:
-            - cfg.env
-            - cgw.env
-            - txs.env
-            - events.env
-            - ui.env
+          loop: "{{ irys_env_files_list }}"
           register: irys_env_files
 
         - name: Fail clearly if any per-service secret file is missing
@@ -358,6 +488,82 @@
               container_env_files/*.env are gitignored and no longer synced by this playbook.
               Provision them on the host first — copy each container_env_files/*.env.example to
               *.env and fill the __CHANGE_ME__ / __PASSWORD__ placeholders — then re-run.
+
+        # A missing file is caught above; an UNFILLED one is worse, because it boots the stack
+        # with a publicly-known Django SECRET_KEY / CGW AUTH_TOKEN. The Config Service admin can
+        # rewrite chain 3282's contract addresses, RPC and transaction-service URLs — i.e. what
+        # the wallet asks owners to sign — so these gates run before the stack is ever started.
+        # __SAFE_DOMAIN__ is deliberately not checked: this playbook fills it in itself below.
+        - name: Scan the env files for unfilled placeholders
+          ansible.builtin.shell:
+            cmd: >-
+              grep -HnF
+              -e '__CHANGE_ME__'
+              -e '__PASSWORD__'
+              -e '__USER__'
+              {{ irys_env_files_list | join(' ') }}
+              || true
+          args:
+            chdir: "{{ irys_dir }}/container_env_files"
+          register: irys_placeholders
+          changed_when: false
+
+        - name: Fail if any placeholder is still unfilled
+          ansible.builtin.assert:
+            that: irys_placeholders.stdout | trim | length == 0
+            fail_msg: |-
+              Unfilled placeholders remain in container_env_files/*.env on the host.
+              Replace every __CHANGE_ME__ / __USER__ / __PASSWORD__ with a real value
+              (generate secrets with `openssl rand -hex 32`) before deploying:
+
+              {{ irys_placeholders.stdout }}
+
+        # The placeholders above are this fork's; these are the upstream repo's committed dev
+        # defaults, which are just as public. Catch them whether they arrived by copying an
+        # older checkout's *.env or by editing only some of the fields.
+        - name: Scan the env files for known-weak upstream defaults
+          ansible.builtin.shell:
+            cmd: >-
+              grep -HnE
+              -e '^ADMIN_PASSWORD=password$'
+              -e '^DJANGO_SUPERUSER_PASSWORD=admin$'
+              -e '^SECRET_KEY=insecure_key_for_dev$'
+              -e "^DJANGO_SECRET_KEY=('|\")?Very-secure-secret-string"
+              -e '^(AUTH_TOKEN|CGW_AUTH_TOKEN)=your_privileged_endpoints_token$'
+              {{ irys_env_files_list | join(' ') }}
+              || true
+          args:
+            chdir: "{{ irys_dir }}/container_env_files"
+          register: irys_weak_defaults
+          changed_when: false
+
+        - name: WARN — known-weak upstream defaults are still in place
+          ansible.builtin.debug:
+            msg: |-
+              container_env_files/*.env still contain values published in the upstream
+              repository. Deferred because irys_accept_default_credentials is set. Rotate
+              these — note that for the admin passwords, editing the env file is NOT enough:
+              the services only read them when first creating the account, so the existing
+              password must be changed in the service itself (RUNBOOK section 10).
+
+              {{ irys_weak_defaults.stdout }}
+          when:
+            - irys_weak_defaults.stdout | trim | length > 0
+            - irys_accept_default_credentials | default(false)
+
+        - name: Fail if any known-weak upstream default is still in place
+          ansible.builtin.assert:
+            that: irys_weak_defaults.stdout | trim | length == 0
+            fail_msg: |-
+              container_env_files/*.env still contain the upstream repo's public dev defaults.
+              These are published in git history, so treat them as compromised:
+
+              {{ irys_weak_defaults.stdout }}
+
+              Rotate them, or set irys_accept_default_credentials: true to defer with a
+              warning (RUNBOOK section 10 has the procedure — for admin passwords the env
+              file alone is not enough, the account already exists).
+          when: not (irys_accept_default_credentials | default(false))
 
         - name: Enable and start the stack (first run pulls images + builds the UI)
           ansible.builtin.systemd_service:
@@ -385,6 +591,23 @@
               Origin Certificate PEM and key, vaulted). Generate them in Cloudflare: SSL/TLS ->
               Origin Server -> Create Certificate. See ansible/vars.example.yml.
 
+        # The Caddyfile derives trusted_leaf_cert from this variable by stripping the PEM
+        # markers and all whitespace. A value holding a full chain (leaf + intermediate) would
+        # concatenate two base64 blobs into one invalid pin, and with `mode require` the
+        # failure mode is every handshake rejected -- the site dark, from a variable that looks
+        # fine. Cloudflare's Origin Certificate download is a single certificate; insist on it.
+        - name: Require exactly one certificate in irys_origin_cert
+          ansible.builtin.assert:
+            that:
+              - irys_origin_cert | regex_findall('-----BEGIN CERTIFICATE-----') | length == 1
+            fail_msg: >-
+              irys_origin_cert must hold exactly ONE certificate (the Cloudflare Origin
+              Certificate leaf), not a chain: the Authenticated Origin Pulls pin is derived
+              from it and a concatenated chain produces an invalid pin that rejects every
+              connection. Found
+              {{ irys_origin_cert | regex_findall('-----BEGIN CERTIFICATE-----') | length }}.
+          when: irys_cf_authenticated_origin_pull | default(true)
+
         - name: Install the Cloudflare Origin certificate
           ansible.builtin.copy:
             content: "{{ irys_origin_cert }}"
@@ -404,15 +627,10 @@
           no_log: true
           notify: Reload caddy
 
-        - name: Install the Cloudflare Authenticated-Origin-Pull CA certificate
-          ansible.builtin.copy:
-            src: "{{ playbook_dir }}/files/cloudflare-aop-ca.pem"
-            dest: "{{ irys_cf_aop_ca_path }}"
-            owner: root
-            group: caddy
-            mode: "0644"
-          when: irys_cf_authenticated_origin_pull | default(true)
-          notify: Reload caddy
+        - name: Remove the legacy Cloudflare origin-pull CA (AOP now pins the leaf certificate)
+          ansible.builtin.file:
+            path: /etc/caddy/cloudflare-aop-ca.pem
+            state: absent
 
         - name: Install the Caddy reverse-proxy config
           ansible.builtin.template:

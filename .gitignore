@@ -12,3 +12,39 @@ ansible/vars.yml
 # Per-service secrets — hold real values; commit the *.env.example templates instead.
 container_env_files/*.env
 container_env_files_backup/
+
+# Isolated copy of the repo used by scripts/upgrade_test.sh (never commit)
+.upgrade-test/
+
+# Records which image versions the production host runs — an inventory of the live
+# deployment, so it stays out of a public repo. Generate it with:
+#   scripts/upgrade_test.sh probe-host <stack-user>@<host> > versions/deployed.env
+versions/deployed.env
+
+# Database dumps (scripts/db_backup.sh). They contain the chain configuration and the full
+# indexed transaction history — sensitive, and far too large for git.
+backups/
+*.sql
+*.dump
+
+# Keys and certificates. The Cloudflare Origin key in particular must never be committed;
+# Ansible installs it from a vaulted variable, not from the repo.
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+
+# Ad-hoc operator files. Anything scratch tends to accumulate credentials; keep it out by
+# default rather than relying on remembering.
+notes.txt
+notes.md
+secrets*
+scratch/
+*.local
+*.bak
+*.orig
+
+# Python bytecode, from importing scripts/verify_deployments.py for its self-test.
+__pycache__/
+*.pyc

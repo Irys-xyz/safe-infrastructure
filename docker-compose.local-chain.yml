@@ -1,0 +1,47 @@
+# Local-chain overlay: run the whole Safe stack against an anvil fork of Irys Mainnet instead
+# of the real chain. See RUNBOOK section 13.
+#
+# Why a *fork* rather than a fresh chain: Safe's canonical contracts are deployed at
+# deterministic CREATE2 addresses, and a bare anvil has none of them. Forking Irys means all 13
+# v1.5.0 contracts are already present at exactly the addresses this stack is configured with,
+# so nothing else has to change -- no redeployment, no address overrides, no rebuilt UI image.
+# The fork keeps chain id 3282, so the config service, the deployments patch and the baked
+# NEXT_PUBLIC_DEFAULT_MAINNET_CHAIN_ID all stay correct.
+#
+# Usage (from the repo root, with a .env that sets the two RPC vars -- see RUNBOOK section 13):
+#   docker compose -f docker-compose.yml -f docker-compose.local-chain.yml up -d anvil
+#   bash scripts/run_locally_podman.sh
+#
+# Writes are local and disposable: `docker compose ... down` throws the forked state away.
+# Nothing you do here can touch Irys Mainnet -- anvil never broadcasts.
+
+services:
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    restart: unless-stopped
+    # Every default and the block-resolution rule live in scripts/anvil-fork.sh, which
+    # scripts/local_testnet.sh runs too -- see its header. Only the wiring is here.
+    environment:
+      LOCAL_FORK_RPC: ${LOCAL_FORK_RPC:-}
+      # Pin the fork block for a reproducible starting state. Leave unset to fork at
+      # (tip - LOCAL_FORK_LAG); set it to `tip` to fork at the tip unpinned.
+      LOCAL_FORK_BLOCK: ${LOCAL_FORK_BLOCK:-}
+      LOCAL_FORK_LAG: ${LOCAL_FORK_LAG:-}
+      # Chain id the fork serves. Default 3282 (Irys Mainnet). Set it to something else so the
+      # fork does not collide with the real Irys network already in a browser wallet, and build
+      # the UI image with the same IRYS_CHAIN_ID (it is baked in).
+      IRYS_CHAIN_ID: ${IRYS_CHAIN_ID:-}
+      LOCAL_BLOCK_TIME: ${LOCAL_BLOCK_TIME:-}
+    volumes:
+      - ./scripts/anvil-fork.sh:/anvil-fork.sh:ro
+    entrypoint: ["sh", "/anvil-fork.sh"]
+    ports:
+      # Loopback only: the browser and MetaMask reach the chain here. Services use anvil:8545.
+      # Parameterised so two forks can run side by side (e.g. an interactive test chain and an
+      # upgrade rehearsal) without colliding on the published port.
+      - "127.0.0.1:${LOCAL_CHAIN_PORT:-8546}:8545"
+    healthcheck:
+      test: ["CMD", "cast", "block-number", "--rpc-url", "http://localhost:8545"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
